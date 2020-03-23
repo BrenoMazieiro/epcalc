@@ -1,3 +1,7 @@
+# Access
+Public access on: https://brenomazieiro.github.io/epcalc/
+
+
 *Psst — looking for a shareable component template? Go here --> [sveltejs/component-template](https://github.com/sveltejs/component-template)*
 
 ---
