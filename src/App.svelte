@@ -376,13 +376,13 @@
     var milestones = []
     for (var i = 0; i < P.length; i++) {
       if (P[i][0] >= 0.5) {
-        milestones.push([i*dt, "First death"])
+        milestones.push([i*dt, "Primeira Morte"])
         break
       }
     }
 
     var i = argmax(P, 1)
-    milestones.push([i*dt, "Peak: " + format(",")(Math.round(P[i][1])) + " hospitalizations"])
+    milestones.push([i*dt, "Pico: " + format(",")(Math.round(P[i][1])) + " hospitalizações"])
 
     return milestones
   }
@@ -590,7 +590,7 @@
 
 </style>
 
-<h2>Epidemic Calculator</h2>
+<h2>Simulador de Epidemias</h2>
 
 <div class="chart" style="display: flex; max-width: 1120px">
 
@@ -605,7 +605,7 @@
         <Arrow height="41"/>
 
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Susceptible</div>
+          <div class="legendtitle">Suscetíveis</div>
           <div style="padding-top: 5px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*Iters[active_][0]))} 
                                   ({ (100*Iters[active_][0]).toFixed(2) }%)</i></div>
@@ -613,7 +613,7 @@
                                  </div>
           </div>
         </div>
-          <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4px; position:relative;">Population not immune to disease.</div>
+          <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4px; position:relative;">População não imune a doença.</div>
 
       </div>
 
@@ -629,11 +629,11 @@
           <div style="padding-top: 5px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*Iters[active_][1]))} 
                                   ({ (100*Iters[active_][1]).toFixed(2) }%)</div>
-          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[1])) } / day</i>
+          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[1])) } / dia</i>
                                  </div>
           </div>
         </div>
-        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4px; position:relative;">Population currently in incubation.</div>
+        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4px; position:relative;">População atualmente incubada.</div>
 
       </div>
 
@@ -644,15 +644,15 @@
         <Arrow height="41"/>   
 
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Infected</div>
+          <div class="legendtitle">Infectados</div>
           <div style="padding-top: 5px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*Iters[active_][2]))} 
                                   ({ (100*Iters[active_][2]).toFixed(2) }%)</div>
-          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[2])) } / day</i>
+          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[2])) } / dia</i>
                                  </div>
           </div>
         </div>
-        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4px; position:relative;">Number of infections <i>actively</i> circulating.</div>
+        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4px; position:relative;">Número de infecções  <i>ativamente</i> circulando.</div>
 
 
       </div>
@@ -664,15 +664,15 @@
         <Arrow height="56" arrowhead="" dasharray="3 2"/>
 
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Removed</div>
+          <div class="legendtitle">Removidos</div>
           <div style="padding-top: 10px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N* (1-Iters[active_][0]-Iters[active_][1]-Iters[active_][2])+I0 ))} 
                                   ({ ((100*(1-Iters[active_][0]-Iters[active_][1]-Iters[active_][2]-I0/N))).toFixed(2) }%)</div>
-          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*(get_d(active_)[3]+get_d(active_)[4]+get_d(active_)[5]+get_d(active_)[6]+get_d(active_)[7]) )) } / day</i>
+          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*(get_d(active_)[3]+get_d(active_)[4]+get_d(active_)[5]+get_d(active_)[6]+get_d(active_)[7]) )) } / dia</i>
                                  </div>
           </div>
         </div>
-        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4x; position:relative;">Population no longer infectious due to isolation or immunity.</div>
+        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 4x; position:relative;">População não mais infectada por isolamento ou imunidade.</div>
 
       </div>
 
@@ -681,14 +681,14 @@
         <Checkbox color="{colors[2]}" bind:checked={checked[2]}/>
         <Arrow height="23" arrowhead="" dasharray="3 2"/>
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Recovered</div>
+          <div class="legendtitle">Recuperados</div>
 
           <div style="padding-top: 3px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*(Iters[active_][7]+Iters[active_][8]) ))} 
                                   ({ (100*(Iters[active_][7]+Iters[active_][8])).toFixed(2) }%)</div>
           </div>
         </div>
-        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 8px; position:relative;">Full recoveries.</div>
+        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 8px; position:relative;">Totalmente Recuperados.</div>
 
       </div>
 
@@ -697,15 +697,15 @@
         <Arrow height="43" arrowhead="" dasharray="3 2"/>
         <Checkbox color="{colors[1]}" bind:checked={checked[1]}/>
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Hospitalized</div>
+          <div class="legendtitle">Hospitalizados</div>
           <div style="padding-top: 3px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*(Iters[active_][5]+Iters[active_][6]) ))} 
                                   ({ (100*(Iters[active_][5]+Iters[active_][6])).toFixed(2) }%)</div>
           </div>
-          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*(get_d(active_)[5]+get_d(active_)[6]))) } / day</i>
+          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*(get_d(active_)[5]+get_d(active_)[6]))) } / dia</i>
                                  </div>
         </div>
-        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 10px; position:relative;">Active hospitalizations.</div>
+        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 10px; position:relative;">Hospitalizações ativas.</div>
 
       </div>
 
@@ -715,15 +715,15 @@
         <Checkbox color="{colors[0]}" bind:checked={checked[0]}/>
 
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Fatalities</div>
+          <div class="legendtitle">Fatalidades</div>
           <div style="padding-top: 3px; padding-bottom: 1px">          
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*Iters[active_][9]))} 
                                   ({ (100*Iters[active_][9]).toFixed(2) }%)</div>
-          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[9])) } / day</i>
+          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[9])) } / dia</i>
                                  </div>
           </div>
         </div>
-        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 10px; position:relative;">Deaths.</div>
+        <div class="legendtext" style="text-align: right; width:105px; left:-111px; top: 10px; position:relative;">Mortes.</div>
       </div>
     </div>
   </div>
@@ -796,9 +796,9 @@
         {/if}
 
         <div id="interventionDrag" class="legendtext" style="flex: 0 0 160px; width:120px; position:relative;  top:-70px; height: 60px; padding-right: 15px; left: -125px; pointer-events: all;cursor:col-resize;" >
-          <div class="paneltitle" style="top:9px; position: relative; text-align: right">Intervention on day {format("d")(InterventionTime)}</div>
+          <div class="paneltitle" style="top:9px; position: relative; text-align: right">Intervenções no dia {format("d")(InterventionTime)}</div>
           <span></span><div style="top:9px; position: relative; text-align: right">
-          (drag me)</div>
+          (arraste)</div>
           <div style="top:43px; left:40px; position: absolute; text-align: right; width: 20px; height:20px; opacity: 0.3">
             <svg width="20" height="20">
               <g transform="rotate(90)">
@@ -834,7 +834,7 @@
             <div style="flex: 0 0 160px; width:200px; position:relative; top:-125px; left: 1px" >
               <div class="caption" style="pointer-events: none; position: absolute; left:0; top:40px; width:150px; border-left: 2px solid #777; padding: 5px 7px 7px 7px; ">      
               <div class="paneltext"  style="height:20px; text-align: right">
-              <div class="paneldesc">to decrease transmission by<br></div>
+              <div class="paneldesc">para diminuir as transmissões por<br></div>
               </div>
               <div style="pointer-events: all">
               <div class="slidertext" on:mousedown={lock_yaxis}>{(InterventionAmt).toFixed(2)}</div>
@@ -844,54 +844,6 @@
             </div>
           </div>
       </div>
-
-<!-- 
-      {#if xScaleTime(InterventionTime+duration) < (width - padding.right)}
-        <div id="dottedline2" style="position: absolute; width:{width+15}px; height: {height}px; position: absolute; top:105px; left:10px; pointer-events: none;">
-          <div style="
-              position: absolute;
-              top:-38px;
-              left:{xScaleTime(InterventionTime+duration)}px;
-              visibility: {(xScaleTime(InterventionTime+duration) < (width - padding.right)) ? 'visible':'hidden'};
-              width:3px;
-              background-color:white;
-              border-right: 1px dashed black;
-              cursor:col-resize;
-              opacity: 0.3;
-              pointer-events: all;
-              height:{height+13}px">
-            <div style="position:absolute; opacity: 0.5; top:-10px; left:10px; width: 120px">
-            <span style="font-size: 13px">{@html math_inline("\\mathcal{R}_t=" + (R0*InterventionAmt).toFixed(2) )}</span> ⟶ 
-            </div>
-          </div>
-        </div>
-
-        <div style="position: absolute; width:{width+15}px; height: {height}px; position: absolute; top:120px; left:10px; pointer-events: none">
-          <div style="
-              opacity: 0.5;
-              position: absolute;
-              top:-38px;
-              left:{xScaleTime(InterventionTime+duration)}px;
-              visibility: {(xScaleTime(InterventionTime+duration) < (width - padding.right)) ? 'visible':'hidden'};
-              width:2px;
-              background-color:#FFF;
-              cursor:col-resize;
-              height:{height}px">
-              <div style="flex: 0 0 160px; width:200px; position:relative; top:-125px; left: 1px" >
-                <div class="caption" style="pointer-events: none; position: absolute; left:0; top:40px; width:150px; border-left: 2px solid #777; padding: 5px 7px 7px 7px; ">      
-                <div class="paneltext"  style="height:20px; text-align: right">
-                <div class="paneldesc">decrease transmission by<br></div>
-                </div>
-                <div style="pointer-events: all">
-                <div class="slidertext" on:mousedown={lock_yaxis}>{(InterventionAmt).toFixed(2)}</div>
-                <input class="range" type=range bind:value={InterventionAmt} min=0 max=1 step=0.01 on:mousedown={lock_yaxis}>
-                </div>
-                </div>
-              </div>
-            </div>
-        </div>
-      {/if} -->
-
 
       <div style="pointer-events: none;
                   position: absolute;
@@ -911,7 +863,7 @@
     
     <div style="opacity:{xScaleTime(InterventionTime) >= 192? 1.0 : 0.2}">
       <div class="tick" style="color: #AAA; position:absolute; pointer-events:all; left:10px; top: 10px">
-        <Checkbox color="#CCC" bind:checked={log}/><div style="position: relative; top: 4px; left:20px">linear scale</div>
+        <Checkbox color="#CCC" bind:checked={log}/><div style="position: relative; top: 4px; left:20px">escala linear</div>
       </div>
     </div>
 
@@ -922,37 +874,37 @@
 
 <div style="height:220px;">
   <div class="minorTitle">
-    <div style="margin: 0px 0px 5px 4px" class="minorTitleColumn">Transmission Dynamics</div>
+    <div style="margin: 0px 0px 5px 4px" class="minorTitleColumn">Dinâmicas de Transmissão</div>
     <div style="flex: 0 0 20; width:20px"></div>
-    <div style="margin: 0px 4px 5px 0px" class="minorTitleColumn">Clinical Dynamics</div>
+    <div style="margin: 0px 4px 5px 0px" class="minorTitleColumn">Dinâmicas Clinicas</div>
   </div>
   <div class = "row">
 
     <div class="column">
-      <div class="paneltitle">Population Inputs</div>
-      <div class="paneldesc" style="height:30px">Size of population.<br></div>
+      <div class="paneltitle">Entradas sobre população</div>
+      <div class="paneldesc" style="height:30px">Tamanho da população<br></div>
       <div class="slidertext">{format(",")(Math.round(N))}</div>
       <input class="range" style="margin-bottom: 8px"type=range bind:value={logN} min={5} max=25 step=0.01>
-      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Number of initial infections.<br></div>
+      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Número inicial de infecções.<br></div>
       <div class="slidertext">{I0}</div>
       <input class="range" type=range bind:value={I0} min={1} max=10000 step=1>
     </div>
 
     <div class="column">
       <div class="paneltext">
-      <div class="paneltitle">Basic Reproduction Number {@html math_inline("\\mathcal{R}_0")} </div>
-      <div class="paneldesc">Measure of contagiousness: the number of secondary infections each infected individual produces. <br></div>
+      <div class="paneltitle">Número básico de reprodução {@html math_inline("\\mathcal{R}_0")} </div>
+      <div class="paneldesc">Medida de contágio: o número de infecções secundárias que cada infecção individual produz. <br></div>
       </div>
       <div class="slidertext">{R0}</div>
       <input class="range" type=range bind:value={R0} min=0.01 max=10 step=0.01> 
     </div>
 
     <div class="column">
-      <div class="paneltitle">Transmission Times</div>
-      <div class="paneldesc" style="height:30px">Length of incubation period, {@html math_inline("T_{\\text{inc}}")}.<br></div>
-      <div class="slidertext">{(D_incbation).toFixed(2)} days</div>
+      <div class="paneltitle">Tempo de transmissão</div>
+      <div class="paneldesc" style="height:30px">Tamanho do período de incubação, {@html math_inline("T_{\\text{inc}}")}.<br></div>
+      <div class="slidertext">{(D_incbation).toFixed(2)} dias</div>
       <input class="range" style="margin-bottom: 8px"type=range bind:value={D_incbation} min={0.15} max=24 step=0.0001>
-      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Duration patient is infectious, {@html math_inline("T_{\\text{inf}}")}.<br></div>
+      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Duração que o paciente é infeccioso, {@html math_inline("T_{\\text{inf}}")}.<br></div>
       <div class="slidertext">{D_infectious} Days</div>
       <input class="range" type=range bind:value={D_infectious} min={0} max=24 step=0.01>
     </div>
@@ -960,32 +912,32 @@
     <div style="flex: 0 0 20; width:20px"></div>
 
     <div class="column">
-      <div class="paneltitle">Morbidity Statistics</div>
-      <div class="paneldesc" style="height:30px">Case fatality rate.<br></div>
+      <div class="paneltitle">Estatísticas de Morbidade</div>
+      <div class="paneldesc" style="height:30px">Taxa de mortalidade de casos.<br></div>
       <div class="slidertext">{(CFR*100).toFixed(2)} %</div>
       <input class="range" style="margin-bottom: 8px" type=range bind:value={CFR} min={0} max=1 step=0.0001>
-      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Time from end of incubation to death.<br></div>
-      <div class="slidertext">{Time_to_death} Days</div>
+      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Tempo desde o final da incubação até a morte.<br></div>
+      <div class="slidertext">{Time_to_death} Dias</div>
       <input class="range" type=range bind:value={Time_to_death} min={(D_infectious)+0.1} max=100 step=0.01>
     </div>
 
     <div class="column">
-      <div class="paneltitle">Recovery Times</div>
-      <div class="paneldesc" style="height:30px">Length of hospital stay<br></div>
+      <div class="paneltitle">Tempo de recuperação</div>
+      <div class="paneldesc" style="height:30px">Tempo de internação hospitalar<br></div>
       <div class="slidertext">{D_recovery_severe} Days</div>
       <input class="range" style="margin-bottom: 8px" type=range bind:value={D_recovery_severe} min={0.1} max=100 step=0.01>
-      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Recovery time for mild cases<br></div>
-      <div class="slidertext">{D_recovery_mild} Days</div>
+      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Tempo de recuperação para casos leves<br></div>
+      <div class="slidertext">{D_recovery_mild} Dias</div>
       <input class="range" type=range bind:value={D_recovery_mild} min={0.5} max=100 step=0.01>
     </div>
 
     <div class="column">
-      <div class="paneltitle">Care statistics</div>
-      <div class="paneldesc" style="height:30px">Hospitalization rate.<br></div>
+      <div class="paneltitle">Estatísticas de cuidados</div>
+      <div class="paneldesc" style="height:30px">Taxa de hospitalização.<br></div>
       <div class="slidertext">{(P_SEVERE*100).toFixed(2)} %</div>
       <input class="range" style="margin-bottom: 8px"type=range bind:value={P_SEVERE} min={0} max=1 step=0.0001>      
-      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Time to hospitalization.<br></div>
-      <div class="slidertext">{D_hospital_lag} Days</div>
+      <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Tempo de hospitalização.<br></div>
+      <div class="slidertext">{D_hospital_lag} Dias</div>
       <input class="range" type=range bind:value={D_hospital_lag} min={0.5} max=100 step=0.01>
     </div>
 
@@ -995,32 +947,34 @@
 <div style="position: relative; height: 12px"></div>
 
 <p class = "center">
-At the time of writing, the coronavirus disease of 2019 remains a global health crisis of grave and uncertain magnitude. To the non-expert (such as myself), contextualizing the numbers, forecasts and epidemiological parameters described in the media and literature can be challenging. I created this calculator as an attempt to address this gap in understanding.
+No momento da redação deste artigo, a doença de coronavírus de 2019 continua sendo uma crise global de saúde de magnitude séria e incerta. Para o não especialista (como eu), contextualizar os números, previsões e parâmetros epidemiológicos descritos na mídia e na literatura pode ser um desafio. Criei esta calculadora como uma tentativa de abordar essa lacuna no entendimento.<br />
+Autor: https://github.com/gabgoh<br />
+Adaptação: https://github.com/BrenoMazieiro<br />
 </p>
 
 <p class = "center">
-This calculator implements a classical infectious disease model &mdash <b><a href="https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SEIR_model">SEIR</a> </b>(<b>S</b>usceptible → <span style="color:{colors[4]}"><b>E</b></span>xposed → <span style="color:{colors[3]}"><b>I</b></span>nfected → <span><b>R</b></span>emoved), an idealized model of spread still used in frontlines of research e.g. [<a href="https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext">Wu, et. al</a>, <a href = "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html">Kucharski et. al</a>]. The dynamics of this model are characterized by a set of four ordinary differential equations that correspond to the stages of the disease's progression:
+Esta calculadora implementa um modelo clássico de doença infecciosa &mdash <b><a href="https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SEIR_model">SEIR</a> </b>(<b>S</b>usceptible → <span style="color:{colors[4]}"><b>E</b></span>xposed → <span style="color:{colors[3]}"><b>I</b></span>nfected → <span><b>R</b></span>emoved), um modelo idealizado de propagação ainda usado nas linhas de frente da pesquisa como em: [<a href="https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext">Wu, et. al</a>, <a href = "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html">Kucharski et. al</a>]. A dinâmica deste modelo é caracterizada por um conjunto de quatro equações diferenciais ordinárias que correspondem aos estágios da progressão da doença:
 <span style="color:#777">{@html ode_eqn}</span>
-In addition to the transmission dynamics, this model allows the use of supplemental timing information to model the death rate and healthcare burden. 
+Além da dinâmica de transmissão, este modelo permite o uso de informações suplementares de tempo para modelar a taxa de mortalidade e a carga de assistência médica.
 </p>
 
 <p class = "center">
-Note that one can use this calculator to measure one's risk exposure to the disease for any given day of the epidemic: the probability of getting infected on day {Math.round(indexToTime(active_))} given <a href="https://www.cdc.gov/coronavirus/2019-ncov/hcp/guidance-risk-assesment-hcp.html">close contact</a> with <input type="text" style="width:{Math.ceil(Math.log10(p_num_ind))*9.5 + 5}px; font-size: 15.5px; color:#777" bind:value={p_num_ind}> individuals is {((1-(Math.pow(1 - (Iters[active_][2])*(0.45/100), p_num_ind)))*100).toFixed(5)}% given an attack rate of 0.45% [<a href="https://www.cdc.gov/mmwr/volumes/69/wr/mm6909e1.htm?s_cid=mm6909e1_w">Burke et. al</a>].
+Observe que alguém pode usar esta calculadora para medir a exposição ao risco da doença em qualquer dia da epidemia: a probabilidade de ser infectado no dia {Math.round(indexToTime(active_))} dado <a href="https://www.cdc.gov/coronavirus/2019-ncov/hcp/guidance-risk-assesment-hcp.html">contato próximo</a> com <input type="text" style="width:{Math.ceil(Math.log10(p_num_ind))*9.5 + 5}px; font-size: 15.5px; color:#777" bind:value={p_num_ind}> individuos é {((1-(Math.pow(1 - (Iters[active_][2])*(0.45/100), p_num_ind)))*100).toFixed(5)}% dada uma taxa de ataque de 0,45% [<a href="https://www.cdc.gov/mmwr/volumes/69/wr/mm6909e1.htm?s_cid=mm6909e1_w">Burke et. al</a>].
 </p>
 
 
 <p class = "center">
-A sampling of the estimates for epidemic parameters are presented below:
+Uma amostra das estimativas para parâmetros epidêmicos é apresentada abaixo:
 </p>
 
 <div class="center">
 <table style="width:100%; margin:auto; font-weight: 300; border-spacing: inherit">
   <tr>
     <th></th>
-    <th>Location</th>
-    <th>Reproduction Number<br> {@html math_inline("\\mathcal{R}_0")}</th>
-    <th>Incubation Period<br> {@html math_inline("T_{\\text{inc}}")} (in days)</th>
-    <th>Infectious Period<br> {@html math_inline("T_{\\text{inf}}")} (in days)</th>
+    <th>Local</th>
+    <th>Número de reprodução<br> {@html math_inline("\\mathcal{R}_0")}</th>
+    <th>Período de incubação<br> {@html math_inline("T_{\\text{inc}}")} (em dias)</th>
+    <th>Período de infecção<br> {@html math_inline("T_{\\text{inf}}")} (em dias)</th>
   </tr>
   <tr>
     <td width="27%"><a href = "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html">Kucharski et. al</a></td>
@@ -1107,25 +1061,21 @@ A sampling of the estimates for epidemic parameters are presented below:
 
 
 <p class="center">
-See [<a href="https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa021/5735319">Liu et. al</a>] detailed survey of current estimates of the reproduction number. Parameters for the diseases' clinical characteristics are taken from the following <a href="https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf">WHO Report</a>. 
+Veja em [<a href="https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa021/5735319">Liu et. al</a>] o levantamento detalhado das estimativas atuais do número de reprodução. Os parâmetros para as características clínicas das doenças são obtidos a partir dos seguintes <a href="https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf">WHO Report</a>. 
 </p>
 
 <p class="center">
 Please DM me feedback <a href="https://twitter.com/gabeeegoooh">here</a> or email me <a href="mailto:izmegabe@gmail.com">here</a>. My <a href="http://gabgoh.github.io/">website</a>.
 </p>
-<!-- 
-<p class="center">
-<a href="https://twitter.com/gabeeegoooh?ref_src=twsrc%5Etfw" class="twitter-follow-button" data-show-count="false"><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
-</p> -->
 
 
 <p class = "center">
-<b> Model Details </b><br>
-The clinical dynamics in this model are an elaboration on SEIR that simulates the disease's progression at a higher resolution, subdividing {@html math_inline("I,R")} into <i>mild</i> (patients who recover without the need for hospitalization), <i>moderate</i> (patients who require hospitalization but survive) and <i>fatal</i> (patients who require hospitalization and do not survive). Each of these variables follows its own trajectory to the final outcome, and the sum of these compartments add up to the values predicted by SEIR. Please refer to the source code for details. Note that we assume, for simplicity, that all fatalities come from hospitals, and that all fatal cases are admitted to hospitals immediately after the infectious period.
+<b> Detalhes do modelo </b><br>
+A dinâmica clínica desse modelo é uma elaboração do SEIR que simula a progressão da doença em uma resolução mais alta, subdividindo {@html math_inline ("I, R")} em <i> leve </i> (pacientes que se recuperam sem a necessidade para hospitalização), <i> moderado </i> (pacientes que necessitam de hospitalização, mas sobrevivem) e <i> fatal </i> (pacientes que necessitam de hospitalização e não sobrevivem). Cada uma dessas variáveis segue sua própria trajetória até o resultado final e a soma desses compartimentos soma os valores previstos pelo SEIR. Por favor, consulte o código fonte para obter detalhes. Observe que assumimos, por simplicidade, que todas as mortes são provenientes de hospitais e que todos os casos fatais são admitidos em hospitais imediatamente após o período infeccioso.
 </p>
 
 <p class = "center">
-<b> Acknowledgements </b><br>
+<b> Agradecimentos </b><br>
 <a href = "https://enkimute.github.io/">Steven De Keninck</a> for RK4 Integrator. <a href="https://twitter.com/ch402">Chris Olah</a>, <a href="https://twitter.com/shancarter">Shan Carter
 </a> and <a href="https://twitter.com/ludwigschubert">Ludwig Schubert
 </a> wonderful feedback. Charlie Huang for context and discussion.
@@ -1135,7 +1085,7 @@ The clinical dynamics in this model are an elaboration on SEIR that simulates th
 <div style="margin-bottom: 30px">
 
   <div class="center" style="padding: 10px; margin-top: 3px; width: 925px">
-    <div class="legendtext">Export parameters:</div>
+    <div class="legendtext">Parametros de Exportação:</div>
     <form>
       <textarea type="textarea" rows="1" cols="5000" style="white-space: nowrap;  overflow: auto; width:100%; text-align: left" id="fname" name="fname">{state}</textarea>
     </form>
