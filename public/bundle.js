@@ -60,7 +60,7 @@
     function attr(node, attribute, value) {
         if (value == null)
             node.removeAttribute(attribute);
-        else
+        else if (node.getAttribute(attribute) !== value)
             node.setAttribute(attribute, value);
     }
     function to_number(value) {
@@ -120,6 +120,20 @@
     function onMount(fn) {
         get_current_component().$$.on_mount.push(fn);
     }
+    function createEventDispatcher() {
+        const component = get_current_component();
+        return (type, detail) => {
+            const callbacks = component.$$.callbacks[type];
+            if (callbacks) {
+                // TODO are there situations where events could be dispatched
+                // in a server (non-DOM) environment?
+                const event = custom_event(type, detail);
+                callbacks.slice().forEach(fn => {
+                    fn.call(component, event);
+                });
+            }
+        };
+    }
 
     const dirty_components = [];
     const binding_callbacks = [];
@@ -139,16 +153,21 @@
     function add_flush_callback(fn) {
         flush_callbacks.push(fn);
     }
+    let flushing = false;
+    const seen_callbacks = new Set();
     function flush() {
-        const seen_callbacks = new Set();
+        if (flushing)
+            return;
+        flushing = true;
         do {
             // first, call beforeUpdate functions
             // and update components
-            while (dirty_components.length) {
-                const component = dirty_components.shift();
+            for (let i = 0; i < dirty_components.length; i += 1) {
+                const component = dirty_components[i];
                 set_current_component(component);
                 update(component.$$);
             }
+            dirty_components.length = 0;
             while (binding_callbacks.length)
                 binding_callbacks.pop()();
             // then, once components are updated, call
@@ -157,9 +176,9 @@
             for (let i = 0; i < render_callbacks.length; i += 1) {
                 const callback = render_callbacks[i];
                 if (!seen_callbacks.has(callback)) {
-                    callback();
                     // ...so guard against infinite loops
                     seen_callbacks.add(callback);
+                    callback();
                 }
             }
             render_callbacks.length = 0;
@@ -168,13 +187,16 @@
             flush_callbacks.pop()();
         }
         update_scheduled = false;
+        flushing = false;
+        seen_callbacks.clear();
     }
     function update($$) {
-        if ($$.fragment) {
-            $$.update($$.dirty);
+        if ($$.fragment !== null) {
+            $$.update();
             run_all($$.before_update);
-            $$.fragment.p($$.dirty, $$.ctx);
-            $$.dirty = null;
+            const dirty = $$.dirty;
+            $$.dirty = [-1];
+            $$.fragment && $$.fragment.p($$.ctx, dirty);
             $$.after_update.forEach(add_render_callback);
         }
     }
@@ -217,14 +239,18 @@
     }
 
     function bind(component, name, callback) {
-        if (component.$$.props.indexOf(name) === -1)
-            return;
-        component.$$.bound[name] = callback;
-        callback(component.$$.ctx[name]);
+        const index = component.$$.props[name];
+        if (index !== undefined) {
+            component.$$.bound[index] = callback;
+            callback(component.$$.ctx[index]);
+        }
+    }
+    function create_component(block) {
+        block && block.c();
     }
     function mount_component(component, target, anchor) {
         const { fragment, on_mount, on_destroy, after_update } = component.$$;
-        fragment.m(target, anchor);
+        fragment && fragment.m(target, anchor);
         // onMount happens before the initial afterUpdate
         add_render_callback(() => {
             const new_on_destroy = on_mount.map(run).filter(is_function);
@@ -241,32 +267,33 @@
         after_update.forEach(add_render_callback);
     }
     function destroy_component(component, detaching) {
-        if (component.$$.fragment) {
-            run_all(component.$$.on_destroy);
-            component.$$.fragment.d(detaching);
+        const $$ = component.$$;
+        if ($$.fragment !== null) {
+            run_all($$.on_destroy);
+            $$.fragment && $$.fragment.d(detaching);
             // TODO null out other refs, including component.$$ (but need to
             // preserve final state?)
-            component.$$.on_destroy = component.$$.fragment = null;
-            component.$$.ctx = {};
+            $$.on_destroy = $$.fragment = null;
+            $$.ctx = [];
         }
     }
-    function make_dirty(component, key) {
-        if (!component.$$.dirty) {
+    function make_dirty(component, i) {
+        if (component.$$.dirty[0] === -1) {
             dirty_components.push(component);
             schedule_update();
-            component.$$.dirty = blank_object();
+            component.$$.dirty.fill(0);
         }
-        component.$$.dirty[key] = true;
+        component.$$.dirty[(i / 31) | 0] |= (1 << (i % 31));
     }
-    function init(component, options, instance, create_fragment, not_equal, prop_names) {
+    function init(component, options, instance, create_fragment, not_equal, props, dirty = [-1]) {
         const parent_component = current_component;
         set_current_component(component);
-        const props = options.props || {};
+        const prop_values = options.props || {};
         const $$ = component.$$ = {
             fragment: null,
             ctx: null,
             // state
-            props: prop_names,
+            props,
             update: noop,
             not_equal,
             bound: blank_object(),
@@ -278,32 +305,36 @@
             context: new Map(parent_component ? parent_component.$$.context : []),
             // everything else
             callbacks: blank_object(),
-            dirty: null
+            dirty
         };
         let ready = false;
         $$.ctx = instance
-            ? instance(component, props, (key, ret, value = ret) => {
-                if ($$.ctx && not_equal($$.ctx[key], $$.ctx[key] = value)) {
-                    if ($$.bound[key])
-                        $$.bound[key](value);
+            ? instance(component, prop_values, (i, ret, ...rest) => {
+                const value = rest.length ? rest[0] : ret;
+                if ($$.ctx && not_equal($$.ctx[i], $$.ctx[i] = value)) {
+                    if ($$.bound[i])
+                        $$.bound[i](value);
                     if (ready)
-                        make_dirty(component, key);
+                        make_dirty(component, i);
                 }
                 return ret;
             })
-            : props;
+            : [];
         $$.update();
         ready = true;
         run_all($$.before_update);
-        $$.fragment = create_fragment($$.ctx);
+        // `false` as a special case of no DOM component
+        $$.fragment = create_fragment ? create_fragment($$.ctx) : false;
         if (options.target) {
             if (options.hydrate) {
+                const nodes = children(options.target);
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                $$.fragment.l(children(options.target));
+                $$.fragment && $$.fragment.l(nodes);
+                nodes.forEach(detach);
             }
             else {
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                $$.fragment.c();
+                $$.fragment && $$.fragment.c();
             }
             if (options.intro)
                 transition_in(component.$$.fragment);
@@ -332,7 +363,7 @@
     }
 
     function dispatch_dev(type, detail) {
-        document.dispatchEvent(custom_event(type, detail));
+        document.dispatchEvent(custom_event(type, Object.assign({ version: '3.20.1' }, detail)));
     }
     function append_dev(target, node) {
         dispatch_dev("SvelteDOMInsert", { target, node });
@@ -377,6 +408,22 @@
         dispatch_dev("SvelteDOMSetData", { node: text, data });
         text.data = data;
     }
+    function validate_each_argument(arg) {
+        if (typeof arg !== 'string' && !(arg && typeof arg === 'object' && 'length' in arg)) {
+            let msg = '{#each} only iterates over array-like objects.';
+            if (typeof Symbol === 'function' && arg && Symbol.iterator in arg) {
+                msg += ' You can use a spread to convert this iterable into an array.';
+            }
+            throw new Error(msg);
+        }
+    }
+    function validate_slots(name, slot, keys) {
+        for (const slot_key of Object.keys(slot)) {
+            if (!~keys.indexOf(slot_key)) {
+                console.warn(`<${name}> received an unexpected slot "${slot_key}".`);
+            }
+        }
+    }
     class SvelteComponentDev extends SvelteComponent {
         constructor(options) {
             if (!options || (!options.target && !options.$$inline)) {
@@ -390,6 +437,8 @@
                 console.warn(`Component was already destroyed`); // eslint-disable-line no-console
             };
         }
+        $capture_state() { }
+        $inject_state() { }
     }
 
     function ascending(a, b) {
@@ -3001,43 +3050,58 @@
       return drag;
     }
 
-    /* src/Chart.svelte generated by Svelte v3.12.1 */
-
+    /* src/Chart.svelte generated by Svelte v3.20.1 */
     const file = "src/Chart.svelte";
 
     function get_each_context(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.i = list[i];
+    	const child_ctx = ctx.slice();
+    	child_ctx[44] = list[i];
     	return child_ctx;
     }
 
     function get_each_context_2(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.j = list[i];
+    	const child_ctx = ctx.slice();
+    	child_ctx[49] = list[i];
     	return child_ctx;
     }
 
     function get_each_context_1(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.i = list[i];
+    	const child_ctx = ctx.slice();
+    	child_ctx[44] = list[i];
     	return child_ctx;
     }
 
     function get_each_context_3(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.i = list[i];
+    	const child_ctx = ctx.slice();
+    	child_ctx[44] = list[i];
     	return child_ctx;
     }
 
     function get_each_context_4(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.tick = list[i];
+    	const child_ctx = ctx.slice();
+    	child_ctx[54] = list[i];
     	return child_ctx;
     }
 
     // (189:6) {#each yScale.ticks(5) as tick}
     function create_each_block_4(ctx) {
-    	var g, line, text_1, t0_value = Number.isInteger(ctx.Math.log10(ctx.tick)) ? formatNumber(ctx.tick) : (ctx.log ? "": formatNumber(ctx.tick)) + "", t0, t1_value = (ctx.tick == ctx.yScale.ticks(5)[0]) ? " ": "" + "", t1, g_class_value, g_transform_value;
+    	let g;
+    	let line;
+    	let text_1;
+
+    	let t0_value = (Number.isInteger(Math.log10(/*tick*/ ctx[54]))
+    	? formatNumber(/*tick*/ ctx[54])
+    	: /*log*/ ctx[3] ? "" : formatNumber(/*tick*/ ctx[54])) + "";
+
+    	let t0;
+
+    	let t1_value = (/*tick*/ ctx[54] == /*yScale*/ ctx[10].ticks(5)[0]
+    	? " "
+    	: "") + "";
+
+    	let t1;
+    	let g_class_value;
+    	let g_transform_value;
 
     	const block = {
     		c: function create() {
@@ -3052,11 +3116,10 @@
     			attr_dev(text_1, "y", "-4");
     			attr_dev(text_1, "class", "svelte-1hzt5y0");
     			add_location(text_1, file, 191, 10, 4026);
-    			attr_dev(g, "class", g_class_value = "tick tick-" + ctx.tick + " svelte-1hzt5y0");
-    			attr_dev(g, "transform", g_transform_value = "translate(0, " + (ctx.yScale(ctx.tick) - ctx.padding.bottom) + ")");
+    			attr_dev(g, "class", g_class_value = "tick tick-" + /*tick*/ ctx[54] + " svelte-1hzt5y0");
+    			attr_dev(g, "transform", g_transform_value = "translate(0, " + (/*yScale*/ ctx[10](/*tick*/ ctx[54]) - /*padding*/ ctx[15].bottom) + ")");
     			add_location(g, file, 189, 8, 3895);
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, g, anchor);
     			append_dev(g, line);
@@ -3064,38 +3127,48 @@
     			append_dev(text_1, t0);
     			append_dev(text_1, t1);
     		},
+    		p: function update(ctx, dirty) {
+    			if (dirty[0] & /*yScale, log*/ 1032 && t0_value !== (t0_value = (Number.isInteger(Math.log10(/*tick*/ ctx[54]))
+    			? formatNumber(/*tick*/ ctx[54])
+    			: /*log*/ ctx[3] ? "" : formatNumber(/*tick*/ ctx[54])) + "")) set_data_dev(t0, t0_value);
 
-    		p: function update(changed, ctx) {
-    			if ((changed.yScale || changed.log) && t0_value !== (t0_value = Number.isInteger(ctx.Math.log10(ctx.tick)) ? formatNumber(ctx.tick) : (ctx.log ? "": formatNumber(ctx.tick)) + "")) {
-    				set_data_dev(t0, t0_value);
-    			}
+    			if (dirty[0] & /*yScale*/ 1024 && t1_value !== (t1_value = (/*tick*/ ctx[54] == /*yScale*/ ctx[10].ticks(5)[0]
+    			? " "
+    			: "") + "")) set_data_dev(t1, t1_value);
 
-    			if ((changed.yScale) && t1_value !== (t1_value = (ctx.tick == ctx.yScale.ticks(5)[0]) ? " ": "" + "")) {
-    				set_data_dev(t1, t1_value);
-    			}
-
-    			if ((changed.yScale) && g_class_value !== (g_class_value = "tick tick-" + ctx.tick + " svelte-1hzt5y0")) {
+    			if (dirty[0] & /*yScale*/ 1024 && g_class_value !== (g_class_value = "tick tick-" + /*tick*/ ctx[54] + " svelte-1hzt5y0")) {
     				attr_dev(g, "class", g_class_value);
     			}
 
-    			if ((changed.yScale) && g_transform_value !== (g_transform_value = "translate(0, " + (ctx.yScale(ctx.tick) - ctx.padding.bottom) + ")")) {
+    			if (dirty[0] & /*yScale*/ 1024 && g_transform_value !== (g_transform_value = "translate(0, " + (/*yScale*/ ctx[10](/*tick*/ ctx[54]) - /*padding*/ ctx[15].bottom) + ")")) {
     				attr_dev(g, "transform", g_transform_value);
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(g);
-    			}
+    			if (detaching) detach_dev(g);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_4.name, type: "each", source: "(189:6) {#each yScale.ticks(5) as tick}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block_4.name,
+    		type: "each",
+    		source: "(189:6) {#each yScale.ticks(5) as tick}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (199:6) {#each xScaleTime.ticks() as i}
     function create_each_block_3(ctx) {
-    	var g, text_1, t0_value = ctx.i == 0 ? "Day ":"" + "", t0, t1_value = ctx.i + "", t1, g_transform_value;
+    	let g;
+    	let text_1;
+    	let t0_value = (/*i*/ ctx[44] == 0 ? "Day " : "") + "";
+    	let t0;
+    	let t1_value = /*i*/ ctx[44] + "";
+    	let t1;
+    	let g_transform_value;
 
     	const block = {
     		c: function create() {
@@ -3108,259 +3181,281 @@
     			attr_dev(text_1, "class", "svelte-1hzt5y0");
     			add_location(text_1, file, 200, 10, 4384);
     			attr_dev(g, "class", "tick svelte-1hzt5y0");
-    			attr_dev(g, "transform", g_transform_value = "translate(" + ctx.xScaleTime(ctx.i) + "," + height + ")");
+    			attr_dev(g, "transform", g_transform_value = "translate(" + /*xScaleTime*/ ctx[8](/*i*/ ctx[44]) + "," + /*height*/ ctx[17] + ")");
     			add_location(g, file, 199, 8, 4309);
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, g, anchor);
     			append_dev(g, text_1);
     			append_dev(text_1, t0);
     			append_dev(text_1, t1);
     		},
+    		p: function update(ctx, dirty) {
+    			if (dirty[0] & /*xScaleTime*/ 256 && t0_value !== (t0_value = (/*i*/ ctx[44] == 0 ? "Day " : "") + "")) set_data_dev(t0, t0_value);
+    			if (dirty[0] & /*xScaleTime*/ 256 && t1_value !== (t1_value = /*i*/ ctx[44] + "")) set_data_dev(t1, t1_value);
 
-    		p: function update(changed, ctx) {
-    			if ((changed.xScaleTime) && t0_value !== (t0_value = ctx.i == 0 ? "Day ":"" + "")) {
-    				set_data_dev(t0, t0_value);
-    			}
-
-    			if ((changed.xScaleTime) && t1_value !== (t1_value = ctx.i + "")) {
-    				set_data_dev(t1, t1_value);
-    			}
-
-    			if ((changed.xScaleTime) && g_transform_value !== (g_transform_value = "translate(" + ctx.xScaleTime(ctx.i) + "," + height + ")")) {
+    			if (dirty[0] & /*xScaleTime*/ 256 && g_transform_value !== (g_transform_value = "translate(" + /*xScaleTime*/ ctx[8](/*i*/ ctx[44]) + "," + /*height*/ ctx[17] + ")")) {
     				attr_dev(g, "transform", g_transform_value);
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(g);
-    			}
+    			if (detaching) detach_dev(g);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_3.name, type: "each", source: "(199:6) {#each xScaleTime.ticks() as i}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block_3.name,
+    		type: "each",
+    		source: "(199:6) {#each xScaleTime.ticks() as i}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (234:10) {:else}
     function create_else_block(ctx) {
-    	var rect, rect_x_value, rect_y_value, rect_height_value, dispose;
+    	let rect;
+    	let rect_x_value;
+    	let rect_y_value;
+    	let rect_height_value;
+    	let dispose;
 
-    	function mouseover_handler_2() {
-    		return ctx.mouseover_handler_2(ctx);
+    	function func(...args) {
+    		return /*func*/ ctx[39](/*i*/ ctx[44], /*j*/ ctx[49], ...args);
     	}
 
-    	function click_handler_2() {
-    		return ctx.click_handler_2(ctx);
+    	function func_1(...args) {
+    		return /*func_1*/ ctx[40](/*i*/ ctx[44], /*j*/ ctx[49], ...args);
     	}
 
-    	function func() {
-    		return ctx.func(ctx);
+    	function mouseover_handler_2(...args) {
+    		return /*mouseover_handler_2*/ ctx[41](/*i*/ ctx[44], ...args);
     	}
 
-    	function func_1() {
-    		return ctx.func_1(ctx);
+    	function click_handler_2(...args) {
+    		return /*click_handler_2*/ ctx[43](/*i*/ ctx[44], ...args);
     	}
 
     	const block = {
     		c: function create() {
     			rect = svg_element("rect");
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = ctx.xScale(ctx.i) + 2);
-    			attr_dev(rect, "y", rect_y_value = (func)());
-    			attr_dev(rect, "width", ctx.barWidth);
-    			attr_dev(rect, "height", rect_height_value = (func_1)());
-    			set_style(rect, "fill", ctx.colors[ctx.j]);
-    			set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
+    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2);
+    			attr_dev(rect, "y", rect_y_value = func());
+    			attr_dev(rect, "width", /*barWidth*/ ctx[12]);
+    			attr_dev(rect, "height", rect_height_value = func_1());
+    			set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
+    			set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
     			add_location(rect, file, 234, 14, 5564);
+    		},
+    		m: function mount(target, anchor, remount) {
+    			insert_dev(target, rect, anchor);
+    			if (remount) run_all(dispose);
 
     			dispose = [
-    				listen_dev(rect, "mouseover", mouseover_handler_2),
-    				listen_dev(rect, "mouseout", ctx.mouseout_handler_2),
-    				listen_dev(rect, "click", click_handler_2)
+    				listen_dev(rect, "mouseover", mouseover_handler_2, false, false, false),
+    				listen_dev(rect, "mouseout", /*mouseout_handler_2*/ ctx[42], false, false, false),
+    				listen_dev(rect, "click", click_handler_2, false, false, false)
     			];
     		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, rect, anchor);
-    		},
-
-    		p: function update(changed, new_ctx) {
+    		p: function update(new_ctx, dirty) {
     			ctx = new_ctx;
-    			if ((changed.xScale || changed.y) && rect_x_value !== (rect_x_value = ctx.xScale(ctx.i) + 2)) {
+
+    			if (dirty[0] & /*xScale, y*/ 130 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if ((changed.yScale || changed.y || changed.colors || changed.checked) && rect_y_value !== (rect_y_value = (func)())) {
+    			if (dirty[0] & /*yScale, y, colors, checked*/ 1046 && rect_y_value !== (rect_y_value = func())) {
     				attr_dev(rect, "y", rect_y_value);
     			}
 
-    			if (changed.barWidth) {
-    				attr_dev(rect, "width", ctx.barWidth);
+    			if (dirty[0] & /*barWidth*/ 4096) {
+    				attr_dev(rect, "width", /*barWidth*/ ctx[12]);
     			}
 
-    			if ((changed.yScaleL || changed.y || changed.colors || changed.checked || changed.yScale) && rect_height_value !== (rect_height_value = (func_1)())) {
+    			if (dirty[0] & /*yScaleL, y, colors, checked, yScale*/ 3094 && rect_height_value !== (rect_height_value = func_1())) {
     				attr_dev(rect, "height", rect_height_value);
     			}
 
-    			if (changed.colors) {
-    				set_style(rect, "fill", ctx.colors[ctx.j]);
+    			if (dirty[0] & /*colors*/ 4) {
+    				set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
     			}
 
-    			if (changed.active || changed.y) {
-    				set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
+    			if (dirty[0] & /*active, y*/ 3) {
+    				set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(rect);
-    			}
-
+    			if (detaching) detach_dev(rect);
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block.name, type: "else", source: "(234:10) {:else}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_else_block.name,
+    		type: "else",
+    		source: "(234:10) {:else}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (221:10) {#if !log}
     function create_if_block_1(ctx) {
-    	var rect, rect_x_value, rect_y_value, rect_height_value, dispose;
+    	let rect;
+    	let rect_x_value;
+    	let rect_y_value;
+    	let rect_height_value;
+    	let dispose;
 
-    	function mouseover_handler_1() {
-    		return ctx.mouseover_handler_1(ctx);
+    	function mouseover_handler_1(...args) {
+    		return /*mouseover_handler_1*/ ctx[36](/*i*/ ctx[44], ...args);
     	}
 
-    	function click_handler_1() {
-    		return ctx.click_handler_1(ctx);
+    	function click_handler_1(...args) {
+    		return /*click_handler_1*/ ctx[38](/*i*/ ctx[44], ...args);
     	}
 
     	const block = {
     		c: function create() {
     			rect = svg_element("rect");
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = ctx.xScale(ctx.i) + 2);
-    			attr_dev(rect, "y", rect_y_value = ctx.yScale( ctx.sum(ctx.y[ctx.i].slice(0,ctx.j+1), ctx.checked) ));
-    			attr_dev(rect, "width", ctx.barWidth);
-    			attr_dev(rect, "height", rect_height_value = ctx.Math.max(height - ctx.padding.bottom - ctx.yScale(ctx.y[ctx.i][ctx.j]*ctx.checked[ctx.j] ),0));
-    			set_style(rect, "fill", ctx.colors[ctx.j]);
-    			set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
+    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2);
+    			attr_dev(rect, "y", rect_y_value = /*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*i*/ ctx[44]].slice(0, /*j*/ ctx[49] + 1), /*checked*/ ctx[4])));
+    			attr_dev(rect, "width", /*barWidth*/ ctx[12]);
+    			attr_dev(rect, "height", rect_height_value = Math.max(/*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*y*/ ctx[1][/*i*/ ctx[44]][/*j*/ ctx[49]] * /*checked*/ ctx[4][/*j*/ ctx[49]]), 0));
+    			set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
+    			set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
     			add_location(rect, file, 221, 14, 4968);
+    		},
+    		m: function mount(target, anchor, remount) {
+    			insert_dev(target, rect, anchor);
+    			if (remount) run_all(dispose);
 
     			dispose = [
-    				listen_dev(rect, "mouseover", mouseover_handler_1),
-    				listen_dev(rect, "mouseout", ctx.mouseout_handler_1),
-    				listen_dev(rect, "click", click_handler_1)
+    				listen_dev(rect, "mouseover", mouseover_handler_1, false, false, false),
+    				listen_dev(rect, "mouseout", /*mouseout_handler_1*/ ctx[37], false, false, false),
+    				listen_dev(rect, "click", click_handler_1, false, false, false)
     			];
     		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, rect, anchor);
-    		},
-
-    		p: function update(changed, new_ctx) {
+    		p: function update(new_ctx, dirty) {
     			ctx = new_ctx;
-    			if ((changed.xScale || changed.y) && rect_x_value !== (rect_x_value = ctx.xScale(ctx.i) + 2)) {
+
+    			if (dirty[0] & /*xScale, y*/ 130 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if ((changed.yScale || changed.y || changed.colors || changed.checked) && rect_y_value !== (rect_y_value = ctx.yScale( ctx.sum(ctx.y[ctx.i].slice(0,ctx.j+1), ctx.checked) ))) {
+    			if (dirty[0] & /*yScale, y, colors, checked*/ 1046 && rect_y_value !== (rect_y_value = /*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*i*/ ctx[44]].slice(0, /*j*/ ctx[49] + 1), /*checked*/ ctx[4])))) {
     				attr_dev(rect, "y", rect_y_value);
     			}
 
-    			if (changed.barWidth) {
-    				attr_dev(rect, "width", ctx.barWidth);
+    			if (dirty[0] & /*barWidth*/ 4096) {
+    				attr_dev(rect, "width", /*barWidth*/ ctx[12]);
     			}
 
-    			if ((changed.yScale || changed.y || changed.colors || changed.checked) && rect_height_value !== (rect_height_value = ctx.Math.max(height - ctx.padding.bottom - ctx.yScale(ctx.y[ctx.i][ctx.j]*ctx.checked[ctx.j] ),0))) {
+    			if (dirty[0] & /*yScale, y, colors, checked*/ 1046 && rect_height_value !== (rect_height_value = Math.max(/*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*y*/ ctx[1][/*i*/ ctx[44]][/*j*/ ctx[49]] * /*checked*/ ctx[4][/*j*/ ctx[49]]), 0))) {
     				attr_dev(rect, "height", rect_height_value);
     			}
 
-    			if (changed.colors) {
-    				set_style(rect, "fill", ctx.colors[ctx.j]);
+    			if (dirty[0] & /*colors*/ 4) {
+    				set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
     			}
 
-    			if (changed.active || changed.y) {
-    				set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
+    			if (dirty[0] & /*active, y*/ 3) {
+    				set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(rect);
-    			}
-
+    			if (detaching) detach_dev(rect);
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1.name, type: "if", source: "(221:10) {#if !log}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block_1.name,
+    		type: "if",
+    		source: "(221:10) {#if !log}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (220:8) {#each range(colors.length) as j}
     function create_each_block_2(ctx) {
-    	var if_block_anchor;
+    	let if_block_anchor;
 
-    	function select_block_type(changed, ctx) {
-    		if (!ctx.log) return create_if_block_1;
+    	function select_block_type(ctx, dirty) {
+    		if (!/*log*/ ctx[3]) return create_if_block_1;
     		return create_else_block;
     	}
 
-    	var current_block_type = select_block_type(null, ctx);
-    	var if_block = current_block_type(ctx);
+    	let current_block_type = select_block_type(ctx);
+    	let if_block = current_block_type(ctx);
 
     	const block = {
     		c: function create() {
     			if_block.c();
     			if_block_anchor = empty();
     		},
-
     		m: function mount(target, anchor) {
     			if_block.m(target, anchor);
     			insert_dev(target, if_block_anchor, anchor);
     		},
-
-    		p: function update(changed, ctx) {
-    			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block) {
-    				if_block.p(changed, ctx);
+    		p: function update(ctx, dirty) {
+    			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
+    				if_block.p(ctx, dirty);
     			} else {
     				if_block.d(1);
     				if_block = current_block_type(ctx);
+
     				if (if_block) {
     					if_block.c();
     					if_block.m(if_block_anchor.parentNode, if_block_anchor);
     				}
     			}
     		},
-
     		d: function destroy(detaching) {
     			if_block.d(detaching);
-
-    			if (detaching) {
-    				detach_dev(if_block_anchor);
-    			}
+    			if (detaching) detach_dev(if_block_anchor);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_2.name, type: "each", source: "(220:8) {#each range(colors.length) as j}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block_2.name,
+    		type: "each",
+    		source: "(220:8) {#each range(colors.length) as j}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (207:6) {#each range(y.length) as i}
     function create_each_block_1(ctx) {
-    	var rect, rect_x_value, rect_width_value, each_1_anchor, dispose;
+    	let rect;
+    	let rect_x_value;
+    	let rect_y_value;
+    	let rect_width_value;
+    	let each_1_anchor;
+    	let dispose;
 
-    	function mouseover_handler() {
-    		return ctx.mouseover_handler(ctx);
+    	function mouseover_handler(...args) {
+    		return /*mouseover_handler*/ ctx[33](/*i*/ ctx[44], ...args);
     	}
 
-    	function click_handler() {
-    		return ctx.click_handler(ctx);
+    	function click_handler(...args) {
+    		return /*click_handler*/ ctx[35](/*i*/ ctx[44], ...args);
     	}
 
-    	let each_value_2 = range(ctx.colors.length);
-
+    	let each_value_2 = range(/*colors*/ ctx[2].length);
+    	validate_each_argument(each_value_2);
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value_2.length; i += 1) {
@@ -3377,22 +3472,15 @@
 
     			each_1_anchor = empty();
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = ctx.xScale(ctx.i) + 2);
-    			attr_dev(rect, "y", 0);
-    			attr_dev(rect, "width", rect_width_value = ctx.barWidth+3);
-    			attr_dev(rect, "height", height);
+    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2);
+    			attr_dev(rect, "y", rect_y_value = 0);
+    			attr_dev(rect, "width", rect_width_value = /*barWidth*/ ctx[12] + 3);
+    			attr_dev(rect, "height", /*height*/ ctx[17]);
     			set_style(rect, "fill", "white");
     			set_style(rect, "opacity", "0");
     			add_location(rect, file, 207, 8, 4535);
-
-    			dispose = [
-    				listen_dev(rect, "mouseover", mouseover_handler),
-    				listen_dev(rect, "mouseout", ctx.mouseout_handler),
-    				listen_dev(rect, "click", click_handler)
-    			];
     		},
-
-    		m: function mount(target, anchor) {
+    		m: function mount(target, anchor, remount) {
     			insert_dev(target, rect, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
@@ -3400,27 +3488,35 @@
     			}
 
     			insert_dev(target, each_1_anchor, anchor);
-    		},
+    			if (remount) run_all(dispose);
 
-    		p: function update(changed, new_ctx) {
+    			dispose = [
+    				listen_dev(rect, "mouseover", mouseover_handler, false, false, false),
+    				listen_dev(rect, "mouseout", /*mouseout_handler*/ ctx[34], false, false, false),
+    				listen_dev(rect, "click", click_handler, false, false, false)
+    			];
+    		},
+    		p: function update(new_ctx, dirty) {
     			ctx = new_ctx;
-    			if ((changed.xScale || changed.y) && rect_x_value !== (rect_x_value = ctx.xScale(ctx.i) + 2)) {
+
+    			if (dirty[0] & /*xScale, y*/ 130 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if ((changed.barWidth) && rect_width_value !== (rect_width_value = ctx.barWidth+3)) {
+    			if (dirty[0] & /*barWidth*/ 4096 && rect_width_value !== (rect_width_value = /*barWidth*/ ctx[12] + 3)) {
     				attr_dev(rect, "width", rect_width_value);
     			}
 
-    			if (changed.log || changed.xScale || changed.range || changed.y || changed.yScale || changed.sum || changed.colors || changed.checked || changed.barWidth || changed.Math || changed.height || changed.padding || changed.active || changed.yScaleL) {
-    				each_value_2 = range(ctx.colors.length);
-
+    			if (dirty[0] & /*xScale, y, yScale, sum, colors, checked, barWidth, height, padding, active, showTip, lock, active_lock, indexToTime, log, yScaleL*/ 196351) {
+    				each_value_2 = range(/*colors*/ ctx[2].length);
+    				validate_each_argument(each_value_2);
     				let i;
+
     				for (i = 0; i < each_value_2.length; i += 1) {
     					const child_ctx = get_each_context_2(ctx, each_value_2, i);
 
     					if (each_blocks[i]) {
-    						each_blocks[i].p(changed, child_ctx);
+    						each_blocks[i].p(child_ctx, dirty);
     					} else {
     						each_blocks[i] = create_each_block_2(child_ctx);
     						each_blocks[i].c();
@@ -3431,81 +3527,91 @@
     				for (; i < each_blocks.length; i += 1) {
     					each_blocks[i].d(1);
     				}
+
     				each_blocks.length = each_value_2.length;
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(rect);
-    			}
-
+    			if (detaching) detach_dev(rect);
     			destroy_each(each_blocks, detaching);
-
-    			if (detaching) {
-    				detach_dev(each_1_anchor);
-    			}
-
+    			if (detaching) detach_dev(each_1_anchor);
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_1.name, type: "each", source: "(207:6) {#each range(y.length) as i}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block_1.name,
+    		type: "each",
+    		source: "(207:6) {#each range(y.length) as i}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (268:6) {#each range(data.length) as i}
     function create_each_block(ctx) {
-    	var rect, rect_x_value, rect_y_value, rect_height_value;
+    	let rect;
+    	let rect_x_value;
+    	let rect_y_value;
+    	let rect_height_value;
 
     	const block = {
     		c: function create() {
     			rect = svg_element("rect");
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = ctx.xScale( ctx.i+28 ) + 2);
-    			attr_dev(rect, "y", rect_y_value = ctx.yScale( ctx.data[ctx.i][1] ));
-    			attr_dev(rect, "width", ctx.barWidth);
-    			attr_dev(rect, "height", rect_height_value = height - ctx.padding.bottom - ctx.yScale( ctx.data[ctx.i][1] ));
+    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44] + 28) + 2);
+    			attr_dev(rect, "y", rect_y_value = /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]));
+    			attr_dev(rect, "width", /*barWidth*/ ctx[12]);
+    			attr_dev(rect, "height", rect_height_value = /*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]));
     			set_style(rect, "fill", "black");
     			set_style(rect, "opacity", "0.5");
     			set_style(rect, "box-shadow", "4px 10px 5px 2px rgba(0,0,0,0.75)");
     			add_location(rect, file, 268, 8, 6892);
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, rect, anchor);
     		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.xScale) && rect_x_value !== (rect_x_value = ctx.xScale( ctx.i+28 ) + 2)) {
+    		p: function update(ctx, dirty) {
+    			if (dirty[0] & /*xScale*/ 128 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44] + 28) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if ((changed.yScale) && rect_y_value !== (rect_y_value = ctx.yScale( ctx.data[ctx.i][1] ))) {
+    			if (dirty[0] & /*yScale*/ 1024 && rect_y_value !== (rect_y_value = /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]))) {
     				attr_dev(rect, "y", rect_y_value);
     			}
 
-    			if (changed.barWidth) {
-    				attr_dev(rect, "width", ctx.barWidth);
+    			if (dirty[0] & /*barWidth*/ 4096) {
+    				attr_dev(rect, "width", /*barWidth*/ ctx[12]);
     			}
 
-    			if ((changed.yScale) && rect_height_value !== (rect_height_value = height - ctx.padding.bottom - ctx.yScale( ctx.data[ctx.i][1] ))) {
+    			if (dirty[0] & /*yScale*/ 1024 && rect_height_value !== (rect_height_value = /*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]))) {
     				attr_dev(rect, "height", rect_height_value);
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(rect);
-    			}
+    			if (detaching) detach_dev(rect);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block.name, type: "each", source: "(268:6) {#each range(data.length) as i}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block.name,
+    		type: "each",
+    		source: "(268:6) {#each range(data.length) as i}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (286:4) {#if active >= 0}
     function create_if_block(ctx) {
-    	var div, svg, path, path_fill_value;
+    	let div;
+    	let svg;
+    	let path;
+    	let path_fill_value;
 
     	const block = {
     		c: function create() {
@@ -3513,7 +3619,7 @@
     			svg = svg_element("svg");
     			path = svg_element("path");
     			attr_dev(path, "d", "M 0 0 L 10 0 L 5 10 z");
-    			attr_dev(path, "fill", path_fill_value = ctx.lock ? '#555':'#AAA');
+    			attr_dev(path, "fill", path_fill_value = /*lock*/ ctx[13] ? "#555" : "#AAA");
     			attr_dev(path, "stroke-width", "3");
     			add_location(path, file, 293, 10, 7898);
     			set_style(svg, "position", "absolute");
@@ -3526,78 +3632,88 @@
     			set_style(div, "position", "absolute");
     			set_style(div, "pointer-events", "none");
     			set_style(div, "width", "100px");
-    			set_style(div, "left", "" + ctx.xScale(ctx.active) + "px");
-    			set_style(div, "top", "" + ctx.Math.max(ctx.yScale(ctx.sum(ctx.y[ctx.active], ctx.checked)),0) + "px");
+    			set_style(div, "left", /*xScale*/ ctx[7](/*active*/ ctx[0]) + "px");
+    			set_style(div, "top", Math.max(/*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*active*/ ctx[0]], /*checked*/ ctx[4])), 0) + "px");
     			attr_dev(div, "class", "tip");
     			add_location(div, file, 286, 6, 7440);
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, div, anchor);
     			append_dev(div, svg);
     			append_dev(svg, path);
     		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.lock) && path_fill_value !== (path_fill_value = ctx.lock ? '#555':'#AAA')) {
+    		p: function update(ctx, dirty) {
+    			if (dirty[0] & /*lock*/ 8192 && path_fill_value !== (path_fill_value = /*lock*/ ctx[13] ? "#555" : "#AAA")) {
     				attr_dev(path, "fill", path_fill_value);
     			}
 
-    			if (changed.xScale || changed.active) {
-    				set_style(div, "left", "" + ctx.xScale(ctx.active) + "px");
+    			if (dirty[0] & /*xScale, active*/ 129) {
+    				set_style(div, "left", /*xScale*/ ctx[7](/*active*/ ctx[0]) + "px");
     			}
 
-    			if (changed.yScale || changed.y || changed.active || changed.checked) {
-    				set_style(div, "top", "" + ctx.Math.max(ctx.yScale(ctx.sum(ctx.y[ctx.active], ctx.checked)),0) + "px");
+    			if (dirty[0] & /*yScale, y, active, checked*/ 1043) {
+    				set_style(div, "top", Math.max(/*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*active*/ ctx[0]], /*checked*/ ctx[4])), 0) + "px");
     			}
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div);
-    			}
+    			if (detaching) detach_dev(div);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block.name, type: "if", source: "(286:4) {#if active >= 0}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block.name,
+    		type: "if",
+    		source: "(286:4) {#if active >= 0}",
+    		ctx
+    	});
+
     	return block;
     }
 
     function create_fragment(ctx) {
-    	var div1, svg, g0, g1, g2, g3, t, div0;
-
-    	let each_value_4 = ctx.yScale.ticks(5);
-
+    	let div1;
+    	let svg;
+    	let g0;
+    	let g0_transform_value;
+    	let g1;
+    	let g2;
+    	let g3;
+    	let t;
+    	let div0;
+    	let each_value_4 = /*yScale*/ ctx[10].ticks(5);
+    	validate_each_argument(each_value_4);
     	let each_blocks_3 = [];
 
     	for (let i = 0; i < each_value_4.length; i += 1) {
     		each_blocks_3[i] = create_each_block_4(get_each_context_4(ctx, each_value_4, i));
     	}
 
-    	let each_value_3 = ctx.xScaleTime.ticks();
-
+    	let each_value_3 = /*xScaleTime*/ ctx[8].ticks();
+    	validate_each_argument(each_value_3);
     	let each_blocks_2 = [];
 
     	for (let i = 0; i < each_value_3.length; i += 1) {
     		each_blocks_2[i] = create_each_block_3(get_each_context_3(ctx, each_value_3, i));
     	}
 
-    	let each_value_1 = range(ctx.y.length);
-
+    	let each_value_1 = range(/*y*/ ctx[1].length);
+    	validate_each_argument(each_value_1);
     	let each_blocks_1 = [];
 
     	for (let i = 0; i < each_value_1.length; i += 1) {
     		each_blocks_1[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
     	}
 
-    	let each_value = range(ctx.data.length);
-
+    	let each_value = range(/*data*/ ctx[18].length);
+    	validate_each_argument(each_value);
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
     		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
     	}
 
-    	var if_block = (ctx.active >= 0) && create_if_block(ctx);
+    	let if_block = /*active*/ ctx[0] >= 0 && create_if_block(ctx);
 
     	const block = {
     		c: function create() {
@@ -3631,7 +3747,7 @@
     			div0 = element("div");
     			if (if_block) if_block.c();
     			attr_dev(g0, "class", "axis y-axis");
-    			attr_dev(g0, "transform", "translate(0," + ctx.padding.top + ")");
+    			attr_dev(g0, "transform", g0_transform_value = "translate(0," + /*padding*/ ctx[15].top + ")");
     			add_location(g0, file, 187, 4, 3786);
     			attr_dev(g1, "class", "axis x-axis svelte-1hzt5y0");
     			add_location(g1, file, 197, 4, 4239);
@@ -3640,28 +3756,26 @@
     			attr_dev(g3, "class", "bars");
     			add_location(g3, file, 266, 4, 6829);
     			set_style(svg, "position", "absolute");
-    			set_style(svg, "height", "" + height + "px");
+    			set_style(svg, "height", /*height*/ ctx[17] + "px");
     			attr_dev(svg, "class", "svelte-1hzt5y0");
     			add_location(svg, file, 184, 2, 3709);
     			set_style(div0, "position", "absolute");
-    			set_style(div0, "width", "" + (width+15) + "px");
-    			set_style(div0, "height", "" + height + "px");
+    			set_style(div0, "width", /*width*/ ctx[16] + 15 + "px");
+    			set_style(div0, "height", /*height*/ ctx[17] + "px");
     			set_style(div0, "position", "absolute");
     			set_style(div0, "top", "0px");
     			set_style(div0, "left", "0px");
     			set_style(div0, "pointer-events", "none");
     			add_location(div0, file, 283, 2, 7274);
-    			set_style(div1, "width", "" + (width+15) + "px");
-    			set_style(div1, "height", "" + height + "px");
+    			set_style(div1, "width", /*width*/ ctx[16] + 15 + "px");
+    			set_style(div1, "height", /*height*/ ctx[17] + "px");
     			set_style(div1, "position", "relative");
     			set_style(div1, "top", "20px");
     			add_location(div1, file, 183, 0, 3624);
     		},
-
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, div1, anchor);
     			append_dev(div1, svg);
@@ -3693,17 +3807,17 @@
     			append_dev(div1, div0);
     			if (if_block) if_block.m(div0, null);
     		},
-
-    		p: function update(changed, ctx) {
-    			if (changed.yScale || changed.padding || changed.Math || changed.formatNumber || changed.log) {
-    				each_value_4 = ctx.yScale.ticks(5);
-
+    		p: function update(ctx, dirty) {
+    			if (dirty[0] & /*yScale, padding, log*/ 33800) {
+    				each_value_4 = /*yScale*/ ctx[10].ticks(5);
+    				validate_each_argument(each_value_4);
     				let i;
+
     				for (i = 0; i < each_value_4.length; i += 1) {
     					const child_ctx = get_each_context_4(ctx, each_value_4, i);
 
     					if (each_blocks_3[i]) {
-    						each_blocks_3[i].p(changed, child_ctx);
+    						each_blocks_3[i].p(child_ctx, dirty);
     					} else {
     						each_blocks_3[i] = create_each_block_4(child_ctx);
     						each_blocks_3[i].c();
@@ -3714,18 +3828,20 @@
     				for (; i < each_blocks_3.length; i += 1) {
     					each_blocks_3[i].d(1);
     				}
+
     				each_blocks_3.length = each_value_4.length;
     			}
 
-    			if (changed.xScaleTime || changed.height) {
-    				each_value_3 = ctx.xScaleTime.ticks();
-
+    			if (dirty[0] & /*xScaleTime, height*/ 131328) {
+    				each_value_3 = /*xScaleTime*/ ctx[8].ticks();
+    				validate_each_argument(each_value_3);
     				let i;
+
     				for (i = 0; i < each_value_3.length; i += 1) {
     					const child_ctx = get_each_context_3(ctx, each_value_3, i);
 
     					if (each_blocks_2[i]) {
-    						each_blocks_2[i].p(changed, child_ctx);
+    						each_blocks_2[i].p(child_ctx, dirty);
     					} else {
     						each_blocks_2[i] = create_each_block_3(child_ctx);
     						each_blocks_2[i].c();
@@ -3736,18 +3852,20 @@
     				for (; i < each_blocks_2.length; i += 1) {
     					each_blocks_2[i].d(1);
     				}
+
     				each_blocks_2.length = each_value_3.length;
     			}
 
-    			if (changed.range || changed.colors || changed.log || changed.xScale || changed.y || changed.yScale || changed.sum || changed.checked || changed.barWidth || changed.Math || changed.height || changed.padding || changed.active || changed.yScaleL) {
-    				each_value_1 = range(ctx.y.length);
-
+    			if (dirty[0] & /*colors, xScale, y, yScale, sum, checked, barWidth, height, padding, active, showTip, lock, active_lock, indexToTime, log, yScaleL*/ 196351) {
+    				each_value_1 = range(/*y*/ ctx[1].length);
+    				validate_each_argument(each_value_1);
     				let i;
+
     				for (i = 0; i < each_value_1.length; i += 1) {
     					const child_ctx = get_each_context_1(ctx, each_value_1, i);
 
     					if (each_blocks_1[i]) {
-    						each_blocks_1[i].p(changed, child_ctx);
+    						each_blocks_1[i].p(child_ctx, dirty);
     					} else {
     						each_blocks_1[i] = create_each_block_1(child_ctx);
     						each_blocks_1[i].c();
@@ -3758,18 +3876,20 @@
     				for (; i < each_blocks_1.length; i += 1) {
     					each_blocks_1[i].d(1);
     				}
+
     				each_blocks_1.length = each_value_1.length;
     			}
 
-    			if (changed.xScale || changed.range || changed.data || changed.yScale || changed.barWidth || changed.height || changed.padding) {
-    				each_value = range(ctx.data.length);
-
+    			if (dirty[0] & /*xScale, data, yScale, barWidth, height, padding*/ 431232) {
+    				each_value = range(/*data*/ ctx[18].length);
+    				validate_each_argument(each_value);
     				let i;
+
     				for (i = 0; i < each_value.length; i += 1) {
     					const child_ctx = get_each_context(ctx, each_value, i);
 
     					if (each_blocks[i]) {
-    						each_blocks[i].p(changed, child_ctx);
+    						each_blocks[i].p(child_ctx, dirty);
     					} else {
     						each_blocks[i] = create_each_block(child_ctx);
     						each_blocks[i].c();
@@ -3780,12 +3900,13 @@
     				for (; i < each_blocks.length; i += 1) {
     					each_blocks[i].d(1);
     				}
+
     				each_blocks.length = each_value.length;
     			}
 
-    			if (ctx.active >= 0) {
+    			if (/*active*/ ctx[0] >= 0) {
     				if (if_block) {
-    					if_block.p(changed, ctx);
+    					if_block.p(ctx, dirty);
     				} else {
     					if_block = create_if_block(ctx);
     					if_block.c();
@@ -3796,200 +3917,166 @@
     				if_block = null;
     			}
     		},
-
     		i: noop,
     		o: noop,
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div1);
-    			}
-
+    			if (detaching) detach_dev(div1);
     			destroy_each(each_blocks_3, detaching);
-
     			destroy_each(each_blocks_2, detaching);
-
     			destroy_each(each_blocks_1, detaching);
-
     			destroy_each(each_blocks, detaching);
-
     			if (if_block) if_block.d();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment.name, type: "component", source: "", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
     	return block;
     }
 
-    let width  = 750;
-
-    let height = 420;
-
-    function range(n){
-      return Array(n).fill().map((_, i) => i);
+    function range(n) {
+    	return Array(n).fill().map((_, i) => i);
     }
 
     function formatNumber(num) {
-      return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,')
+    	return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, "$1,");
     }
 
     function instance($$self, $$props, $$invalidate) {
+    	const dispatch = createEventDispatcher();
 
-      var sum = function(arr, bools){
-        var x = 0;
-        for (var i = 0; i < arr.length; i++) {
-          x = x + arr[i]*(bools[i] ? 1 : 0);
-        }
-        return x
-      };
+    	var sum = function (arr, bools) {
+    		var x = 0;
 
-      let { y, tmax, xmax, deaths, total, vline, timestep, total_infected, N, ymax, InterventionTime, colors, log: log$1 = false } = $$props;
+    		for (var i = 0; i < arr.length; i++) {
+    			x = x + arr[i] * (bools[i] ? 1 : 0);
+    		}
 
-      const padding = { top: 20, right: 0, bottom: 20, left: 25 };
-      var active_lock = 0;
-      let { active, checked } = $$props;
+    		return x;
+    	};
 
-      // var data = [[2   , 2  ], [5   , 2  ], [18  , 4  ], [28  , 6  ], [43  , 8  ], [61  , 12 ], [95  , 16 ], [139 , 19 ], [245 , 26 ], [388 , 34 ], [593 , 43 ], [978 , 54 ], [1501, 66 ], [2336, 77 ], [2922, 92 ], [3513, 107], [4747, 124]]
-      var data = [];
+    	let { y } = $$props;
+    	let { tmax } = $$props;
+    	let { xmax } = $$props;
+    	let { deaths } = $$props;
+    	let { total } = $$props;
+    	let { vline } = $$props;
+    	let { timestep } = $$props;
+    	let { total_infected } = $$props;
+    	let { N } = $$props;
+    	let { ymax } = $$props;
+    	let { InterventionTime } = $$props;
+    	let { colors } = $$props;
+    	let { log: log$1 = false } = $$props;
+    	const padding = { top: 20, right: 0, bottom: 20, left: 25 };
+    	let width = 750;
+    	let height = 420;
+    	var active_lock = 0;
+    	let { active } = $$props;
+    	let { checked } = $$props;
 
-    	const writable_props = ['y', 'tmax', 'xmax', 'deaths', 'total', 'vline', 'timestep', 'total_infected', 'N', 'ymax', 'InterventionTime', 'colors', 'log', 'active', 'checked'];
+    	// var data = [[2   , 2  ], [5   , 2  ], [18  , 4  ], [28  , 6  ], [43  , 8  ], [61  , 12 ], [95  , 16 ], [139 , 19 ], [245 , 26 ], [388 , 34 ], [593 , 43 ], [978 , 54 ], [1501, 66 ], [2336, 77 ], [2922, 92 ], [3513, 107], [4747, 124]]
+    	var data = [];
+
+    	const writable_props = [
+    		"y",
+    		"tmax",
+    		"xmax",
+    		"deaths",
+    		"total",
+    		"vline",
+    		"timestep",
+    		"total_infected",
+    		"N",
+    		"ymax",
+    		"InterventionTime",
+    		"colors",
+    		"log",
+    		"active",
+    		"checked"
+    	];
+
     	Object.keys($$props).forEach(key => {
-    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Chart> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Chart> was created with unknown prop '${key}'`);
     	});
 
-    	const mouseover_handler = ({ i }) => showTip(i);
-
+    	let { $$slots = {}, $$scope } = $$props;
+    	validate_slots("Chart", $$slots, []);
+    	const mouseover_handler = i => showTip(i);
     	const mouseout_handler = () => showTip(-1);
 
-    	const click_handler = ({ i }) => {$$invalidate('lock', lock = !lock); $$invalidate('active_lock', active_lock = indexToTime(i)); };
+    	const click_handler = i => {
+    		$$invalidate(13, lock = !lock);
+    		$$invalidate(5, active_lock = indexToTime(i));
+    	};
 
-    	const mouseover_handler_1 = ({ i }) => showTip(i);
-
+    	const mouseover_handler_1 = i => showTip(i);
     	const mouseout_handler_1 = () => showTip(-1);
 
-    	const click_handler_1 = ({ i }) => {$$invalidate('lock', lock = !lock); $$invalidate('active_lock', active_lock = indexToTime(i)); };
+    	const click_handler_1 = i => {
+    		$$invalidate(13, lock = !lock);
+    		$$invalidate(5, active_lock = indexToTime(i));
+    	};
 
-    	const mouseover_handler_2 = ({ i }) => showTip(i);
+    	const func = function (i, j) {
+    		var z = yScale(sum(y[i].slice(0, j + 1), checked));
+    		return Math.min(isNaN(z) ? 0 : z, height - padding.top);
+    	};
 
+    	const func_1 = function (i, j) {
+    		var top = yScaleL(sum(y[i].slice(0, j + 1), checked) + 0.0001);
+    		var btm = yScaleL(sum(y[i].slice(0, j), checked) + 0.0001);
+    		var z = top - btm;
+
+    		if (z + yScale(sum(y[i].slice(0, j + 1), checked)) > height - padding.top) {
+    			return top;
+    		} else {
+    			return Math.max(isNaN(z) ? 0 : z, 0);
+    		}
+    	};
+
+    	const mouseover_handler_2 = i => showTip(i);
     	const mouseout_handler_2 = () => showTip(-1);
 
-    	const click_handler_2 = ({ i }) => {$$invalidate('lock', lock = !lock); $$invalidate('active_lock', active_lock = indexToTime(i)); };
-
-    	function func({ i, j }) { 
-    	                        var z = yScale( sum(y[i].slice(0,j+1), checked) ); 
-    	                        return Math.min(isNaN(z) ? 0: z, height - padding.top)
-    	                      }
-
-    	function func_1({ i, j }) {
-    	                  var top = yScaleL( sum(y[i].slice(0,j+1),checked) + 0.0001 );
-    	                  var btm = yScaleL( sum(y[i].slice(0,j),checked) + 0.0001);
-    	                  var z = top - btm; 
-    	                  if (z + yScale( sum(y[i].slice(0,j+1), checked) ) > height - padding.top) {
-    	                    return top
-    	                  } else {
-    	                    return Math.max(isNaN(z) ? 0 : z,0)
-    	                  }}
+    	const click_handler_2 = i => {
+    		$$invalidate(13, lock = !lock);
+    		$$invalidate(5, active_lock = indexToTime(i));
+    	};
 
     	$$self.$set = $$props => {
-    		if ('y' in $$props) $$invalidate('y', y = $$props.y);
-    		if ('tmax' in $$props) $$invalidate('tmax', tmax = $$props.tmax);
-    		if ('xmax' in $$props) $$invalidate('xmax', xmax = $$props.xmax);
-    		if ('deaths' in $$props) $$invalidate('deaths', deaths = $$props.deaths);
-    		if ('total' in $$props) $$invalidate('total', total = $$props.total);
-    		if ('vline' in $$props) $$invalidate('vline', vline = $$props.vline);
-    		if ('timestep' in $$props) $$invalidate('timestep', timestep = $$props.timestep);
-    		if ('total_infected' in $$props) $$invalidate('total_infected', total_infected = $$props.total_infected);
-    		if ('N' in $$props) $$invalidate('N', N = $$props.N);
-    		if ('ymax' in $$props) $$invalidate('ymax', ymax = $$props.ymax);
-    		if ('InterventionTime' in $$props) $$invalidate('InterventionTime', InterventionTime = $$props.InterventionTime);
-    		if ('colors' in $$props) $$invalidate('colors', colors = $$props.colors);
-    		if ('log' in $$props) $$invalidate('log', log$1 = $$props.log);
-    		if ('active' in $$props) $$invalidate('active', active = $$props.active);
-    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
+    		if ("y" in $$props) $$invalidate(1, y = $$props.y);
+    		if ("tmax" in $$props) $$invalidate(19, tmax = $$props.tmax);
+    		if ("xmax" in $$props) $$invalidate(20, xmax = $$props.xmax);
+    		if ("deaths" in $$props) $$invalidate(21, deaths = $$props.deaths);
+    		if ("total" in $$props) $$invalidate(22, total = $$props.total);
+    		if ("vline" in $$props) $$invalidate(23, vline = $$props.vline);
+    		if ("timestep" in $$props) $$invalidate(24, timestep = $$props.timestep);
+    		if ("total_infected" in $$props) $$invalidate(25, total_infected = $$props.total_infected);
+    		if ("N" in $$props) $$invalidate(26, N = $$props.N);
+    		if ("ymax" in $$props) $$invalidate(27, ymax = $$props.ymax);
+    		if ("InterventionTime" in $$props) $$invalidate(28, InterventionTime = $$props.InterventionTime);
+    		if ("colors" in $$props) $$invalidate(2, colors = $$props.colors);
+    		if ("log" in $$props) $$invalidate(3, log$1 = $$props.log);
+    		if ("active" in $$props) $$invalidate(0, active = $$props.active);
+    		if ("checked" in $$props) $$invalidate(4, checked = $$props.checked);
     	};
 
-    	$$self.$capture_state = () => {
-    		return { sum, y, tmax, xmax, deaths, total, vline, timestep, total_infected, N, ymax, InterventionTime, colors, log: log$1, width, height, active_lock, active, checked, data, showTip, active_hover, xScale, xScaleTime, indexToTime, timeToIndex, yScale, yScaleL, innerWidth, barWidth, lock };
-    	};
-
-    	$$self.$inject_state = $$props => {
-    		if ('sum' in $$props) $$invalidate('sum', sum = $$props.sum);
-    		if ('y' in $$props) $$invalidate('y', y = $$props.y);
-    		if ('tmax' in $$props) $$invalidate('tmax', tmax = $$props.tmax);
-    		if ('xmax' in $$props) $$invalidate('xmax', xmax = $$props.xmax);
-    		if ('deaths' in $$props) $$invalidate('deaths', deaths = $$props.deaths);
-    		if ('total' in $$props) $$invalidate('total', total = $$props.total);
-    		if ('vline' in $$props) $$invalidate('vline', vline = $$props.vline);
-    		if ('timestep' in $$props) $$invalidate('timestep', timestep = $$props.timestep);
-    		if ('total_infected' in $$props) $$invalidate('total_infected', total_infected = $$props.total_infected);
-    		if ('N' in $$props) $$invalidate('N', N = $$props.N);
-    		if ('ymax' in $$props) $$invalidate('ymax', ymax = $$props.ymax);
-    		if ('InterventionTime' in $$props) $$invalidate('InterventionTime', InterventionTime = $$props.InterventionTime);
-    		if ('colors' in $$props) $$invalidate('colors', colors = $$props.colors);
-    		if ('log' in $$props) $$invalidate('log', log$1 = $$props.log);
-    		if ('width' in $$props) $$invalidate('width', width = $$props.width);
-    		if ('height' in $$props) $$invalidate('height', height = $$props.height);
-    		if ('active_lock' in $$props) $$invalidate('active_lock', active_lock = $$props.active_lock);
-    		if ('active' in $$props) $$invalidate('active', active = $$props.active);
-    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
-    		if ('data' in $$props) $$invalidate('data', data = $$props.data);
-    		if ('showTip' in $$props) $$invalidate('showTip', showTip = $$props.showTip);
-    		if ('active_hover' in $$props) $$invalidate('active_hover', active_hover = $$props.active_hover);
-    		if ('xScale' in $$props) $$invalidate('xScale', xScale = $$props.xScale);
-    		if ('xScaleTime' in $$props) $$invalidate('xScaleTime', xScaleTime = $$props.xScaleTime);
-    		if ('indexToTime' in $$props) $$invalidate('indexToTime', indexToTime = $$props.indexToTime);
-    		if ('timeToIndex' in $$props) $$invalidate('timeToIndex', timeToIndex = $$props.timeToIndex);
-    		if ('yScale' in $$props) $$invalidate('yScale', yScale = $$props.yScale);
-    		if ('yScaleL' in $$props) $$invalidate('yScaleL', yScaleL = $$props.yScaleL);
-    		if ('innerWidth' in $$props) $$invalidate('innerWidth', innerWidth = $$props.innerWidth);
-    		if ('barWidth' in $$props) $$invalidate('barWidth', barWidth = $$props.barWidth);
-    		if ('lock' in $$props) $$invalidate('lock', lock = $$props.lock);
-    	};
-
-    	let showTip, xScale, xScaleTime, indexToTime, timeToIndex, yScale, yScaleL, innerWidth, barWidth, active_hover, lock;
-
-    	$$self.$$.update = ($$dirty = { y: 1, width: 1, tmax: 1, log: 1, ymax: 1, height: 1, innerWidth: 1, lock: 1, timeToIndex: 1, active_lock: 1, active_hover: 1 }) => {
-    		if ($$dirty.y || $$dirty.width) { $$invalidate('xScale', xScale = linear$1()
-            .domain([0, y.length])
-            .range([padding.left, width - padding.right])); }
-    		if ($$dirty.tmax || $$dirty.width) { $$invalidate('xScaleTime', xScaleTime = linear$1()
-            .domain([0, tmax])
-            .range([padding.left, width - padding.right])); }
-    		if ($$dirty.y || $$dirty.tmax) { $$invalidate('indexToTime', indexToTime = linear$1()
-            .domain([0, y.length])
-            .range([0, tmax])); }
-    		if ($$dirty.tmax || $$dirty.y) { $$invalidate('timeToIndex', timeToIndex = linear$1()
-            .domain([0, tmax])
-            .range([0, y.length])); }
-    		if ($$dirty.log || $$dirty.ymax || $$dirty.height) { $$invalidate('yScale', yScale = (log$1 ? log(): linear$1())
-            .domain([log$1 ? 1: 0,  ymax/1])
-            .range([height - padding.bottom, padding.top])); }
-    		if ($$dirty.ymax || $$dirty.height) { $$invalidate('yScaleL', yScaleL = log()
-            .domain([1,  ymax/1])
-            .range([0, height - padding.bottom - padding.top])); }
-    		if ($$dirty.width) { $$invalidate('innerWidth', innerWidth = width - (padding.left + padding.right)); }
-    		if ($$dirty.innerWidth || $$dirty.y) { $$invalidate('barWidth', barWidth = innerWidth / y.length - 1.5); }
-    		if ($$dirty.lock || $$dirty.timeToIndex || $$dirty.active_lock || $$dirty.active_hover) { $$invalidate('active', active = (function () {
-            if (lock){
-              var i = Math.round(timeToIndex(active_lock));
-              if (i > 99) {
-                $$invalidate('lock', lock = false);
-                i = 0;
-              } else {
-                return i
-              }
-            } else {
-              return active_hover
-            }
-          })()); }
-    	};
-
-    	$$invalidate('showTip', showTip = function (i) {
-            $$invalidate('active_hover', active_hover = i);
-          });
-    	$$invalidate('active_hover', active_hover = -1);
-    	$$invalidate('lock', lock = false);
-
-    	return {
+    	$$self.$capture_state = () => ({
+    		scaleLinear: linear$1,
+    		scaleLog: log,
+    		drag,
+    		selectAll,
+    		onMount,
+    		createEventDispatcher,
+    		dispatch,
+    		range,
+    		formatNumber,
     		sum,
     		y,
     		tmax,
@@ -4005,10 +4092,137 @@
     		colors,
     		log: log$1,
     		padding,
+    		width,
+    		height,
     		active_lock,
     		active,
     		checked,
     		data,
+    		showTip,
+    		active_hover,
+    		xScale,
+    		xScaleTime,
+    		indexToTime,
+    		timeToIndex,
+    		yScale,
+    		yScaleL,
+    		innerWidth,
+    		barWidth,
+    		lock
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("sum" in $$props) $$invalidate(14, sum = $$props.sum);
+    		if ("y" in $$props) $$invalidate(1, y = $$props.y);
+    		if ("tmax" in $$props) $$invalidate(19, tmax = $$props.tmax);
+    		if ("xmax" in $$props) $$invalidate(20, xmax = $$props.xmax);
+    		if ("deaths" in $$props) $$invalidate(21, deaths = $$props.deaths);
+    		if ("total" in $$props) $$invalidate(22, total = $$props.total);
+    		if ("vline" in $$props) $$invalidate(23, vline = $$props.vline);
+    		if ("timestep" in $$props) $$invalidate(24, timestep = $$props.timestep);
+    		if ("total_infected" in $$props) $$invalidate(25, total_infected = $$props.total_infected);
+    		if ("N" in $$props) $$invalidate(26, N = $$props.N);
+    		if ("ymax" in $$props) $$invalidate(27, ymax = $$props.ymax);
+    		if ("InterventionTime" in $$props) $$invalidate(28, InterventionTime = $$props.InterventionTime);
+    		if ("colors" in $$props) $$invalidate(2, colors = $$props.colors);
+    		if ("log" in $$props) $$invalidate(3, log$1 = $$props.log);
+    		if ("width" in $$props) $$invalidate(16, width = $$props.width);
+    		if ("height" in $$props) $$invalidate(17, height = $$props.height);
+    		if ("active_lock" in $$props) $$invalidate(5, active_lock = $$props.active_lock);
+    		if ("active" in $$props) $$invalidate(0, active = $$props.active);
+    		if ("checked" in $$props) $$invalidate(4, checked = $$props.checked);
+    		if ("data" in $$props) $$invalidate(18, data = $$props.data);
+    		if ("showTip" in $$props) $$invalidate(6, showTip = $$props.showTip);
+    		if ("active_hover" in $$props) $$invalidate(29, active_hover = $$props.active_hover);
+    		if ("xScale" in $$props) $$invalidate(7, xScale = $$props.xScale);
+    		if ("xScaleTime" in $$props) $$invalidate(8, xScaleTime = $$props.xScaleTime);
+    		if ("indexToTime" in $$props) $$invalidate(9, indexToTime = $$props.indexToTime);
+    		if ("timeToIndex" in $$props) $$invalidate(30, timeToIndex = $$props.timeToIndex);
+    		if ("yScale" in $$props) $$invalidate(10, yScale = $$props.yScale);
+    		if ("yScaleL" in $$props) $$invalidate(11, yScaleL = $$props.yScaleL);
+    		if ("innerWidth" in $$props) $$invalidate(31, innerWidth = $$props.innerWidth);
+    		if ("barWidth" in $$props) $$invalidate(12, barWidth = $$props.barWidth);
+    		if ("lock" in $$props) $$invalidate(13, lock = $$props.lock);
+    	};
+
+    	let showTip;
+    	let xScale;
+    	let xScaleTime;
+    	let indexToTime;
+    	let timeToIndex;
+    	let yScale;
+    	let yScaleL;
+    	let innerWidth;
+    	let barWidth;
+    	let active_hover;
+    	let lock;
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty[0] & /*y*/ 2) {
+    			 $$invalidate(7, xScale = linear$1().domain([0, y.length]).range([padding.left, width - padding.right]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*tmax*/ 524288) {
+    			 $$invalidate(8, xScaleTime = linear$1().domain([0, tmax]).range([padding.left, width - padding.right]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*y, tmax*/ 524290) {
+    			 $$invalidate(9, indexToTime = linear$1().domain([0, y.length]).range([0, tmax]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*tmax, y*/ 524290) {
+    			 $$invalidate(30, timeToIndex = linear$1().domain([0, tmax]).range([0, y.length]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*log, ymax*/ 134217736) {
+    			 $$invalidate(10, yScale = (log$1 ? log() : linear$1()).domain([log$1 ? 1 : 0, ymax / 1]).range([height - padding.bottom, padding.top]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*ymax*/ 134217728) {
+    			 $$invalidate(11, yScaleL = log().domain([1, ymax / 1]).range([0, height - padding.bottom - padding.top]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*y*/ 2 | $$self.$$.dirty[1] & /*innerWidth*/ 1) {
+    			 $$invalidate(12, barWidth = innerWidth / y.length - 1.5);
+    		}
+
+    		if ($$self.$$.dirty[0] & /*lock, timeToIndex, active_lock, active_hover*/ 1610620960) {
+    			 $$invalidate(0, active = (function () {
+    				if (lock) {
+    					var i = Math.round(timeToIndex(active_lock));
+
+    					if (i > 99) {
+    						$$invalidate(13, lock = false);
+    						i = 0;
+    					} else {
+    						return i;
+    					}
+    				} else {
+    					return active_hover;
+    				}
+    			})());
+    		}
+    	};
+
+    	 $$invalidate(6, showTip = function (i) {
+    		$$invalidate(29, active_hover = i);
+    	});
+
+    	 $$invalidate(31, innerWidth = width - (padding.left + padding.right));
+    	 $$invalidate(29, active_hover = -1);
+    	 $$invalidate(13, lock = false);
+
+    	return [
+    		active,
+    		y,
+    		colors,
+    		log$1,
+    		checked,
+    		active_lock,
     		showTip,
     		xScale,
     		xScaleTime,
@@ -4017,69 +4231,132 @@
     		yScaleL,
     		barWidth,
     		lock,
-    		Math,
+    		sum,
+    		padding,
+    		width,
+    		height,
+    		data,
+    		tmax,
+    		xmax,
+    		deaths,
+    		total,
+    		vline,
+    		timestep,
+    		total_infected,
+    		N,
+    		ymax,
+    		InterventionTime,
+    		active_hover,
+    		timeToIndex,
+    		innerWidth,
+    		dispatch,
     		mouseover_handler,
     		mouseout_handler,
     		click_handler,
     		mouseover_handler_1,
     		mouseout_handler_1,
     		click_handler_1,
+    		func,
+    		func_1,
     		mouseover_handler_2,
     		mouseout_handler_2,
-    		click_handler_2,
-    		func,
-    		func_1
-    	};
+    		click_handler_2
+    	];
     }
 
     class Chart extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance, create_fragment, safe_not_equal, ["y", "tmax", "xmax", "deaths", "total", "vline", "timestep", "total_infected", "N", "ymax", "InterventionTime", "colors", "log", "active", "checked"]);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Chart", options, id: create_fragment.name });
+
+    		init(
+    			this,
+    			options,
+    			instance,
+    			create_fragment,
+    			safe_not_equal,
+    			{
+    				y: 1,
+    				tmax: 19,
+    				xmax: 20,
+    				deaths: 21,
+    				total: 22,
+    				vline: 23,
+    				timestep: 24,
+    				total_infected: 25,
+    				N: 26,
+    				ymax: 27,
+    				InterventionTime: 28,
+    				colors: 2,
+    				log: 3,
+    				active: 0,
+    				checked: 4
+    			},
+    			[-1, -1]
+    		);
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Chart",
+    			options,
+    			id: create_fragment.name
+    		});
 
     		const { ctx } = this.$$;
     		const props = options.props || {};
-    		if (ctx.y === undefined && !('y' in props)) {
+
+    		if (/*y*/ ctx[1] === undefined && !("y" in props)) {
     			console.warn("<Chart> was created without expected prop 'y'");
     		}
-    		if (ctx.tmax === undefined && !('tmax' in props)) {
+
+    		if (/*tmax*/ ctx[19] === undefined && !("tmax" in props)) {
     			console.warn("<Chart> was created without expected prop 'tmax'");
     		}
-    		if (ctx.xmax === undefined && !('xmax' in props)) {
+
+    		if (/*xmax*/ ctx[20] === undefined && !("xmax" in props)) {
     			console.warn("<Chart> was created without expected prop 'xmax'");
     		}
-    		if (ctx.deaths === undefined && !('deaths' in props)) {
+
+    		if (/*deaths*/ ctx[21] === undefined && !("deaths" in props)) {
     			console.warn("<Chart> was created without expected prop 'deaths'");
     		}
-    		if (ctx.total === undefined && !('total' in props)) {
+
+    		if (/*total*/ ctx[22] === undefined && !("total" in props)) {
     			console.warn("<Chart> was created without expected prop 'total'");
     		}
-    		if (ctx.vline === undefined && !('vline' in props)) {
+
+    		if (/*vline*/ ctx[23] === undefined && !("vline" in props)) {
     			console.warn("<Chart> was created without expected prop 'vline'");
     		}
-    		if (ctx.timestep === undefined && !('timestep' in props)) {
+
+    		if (/*timestep*/ ctx[24] === undefined && !("timestep" in props)) {
     			console.warn("<Chart> was created without expected prop 'timestep'");
     		}
-    		if (ctx.total_infected === undefined && !('total_infected' in props)) {
+
+    		if (/*total_infected*/ ctx[25] === undefined && !("total_infected" in props)) {
     			console.warn("<Chart> was created without expected prop 'total_infected'");
     		}
-    		if (ctx.N === undefined && !('N' in props)) {
+
+    		if (/*N*/ ctx[26] === undefined && !("N" in props)) {
     			console.warn("<Chart> was created without expected prop 'N'");
     		}
-    		if (ctx.ymax === undefined && !('ymax' in props)) {
+
+    		if (/*ymax*/ ctx[27] === undefined && !("ymax" in props)) {
     			console.warn("<Chart> was created without expected prop 'ymax'");
     		}
-    		if (ctx.InterventionTime === undefined && !('InterventionTime' in props)) {
+
+    		if (/*InterventionTime*/ ctx[28] === undefined && !("InterventionTime" in props)) {
     			console.warn("<Chart> was created without expected prop 'InterventionTime'");
     		}
-    		if (ctx.colors === undefined && !('colors' in props)) {
+
+    		if (/*colors*/ ctx[2] === undefined && !("colors" in props)) {
     			console.warn("<Chart> was created without expected prop 'colors'");
     		}
-    		if (ctx.active === undefined && !('active' in props)) {
+
+    		if (/*active*/ ctx[0] === undefined && !("active" in props)) {
     			console.warn("<Chart> was created without expected prop 'active'");
     		}
-    		if (ctx.checked === undefined && !('checked' in props)) {
+
+    		if (/*checked*/ ctx[4] === undefined && !("checked" in props)) {
     			console.warn("<Chart> was created without expected prop 'checked'");
     		}
     	}
@@ -4679,12 +4956,16 @@
     var queryString_4 = queryString.parseUrl;
     var queryString_5 = queryString.stringifyUrl;
 
-    /* src/Checkbox.svelte generated by Svelte v3.12.1 */
+    /* src/Checkbox.svelte generated by Svelte v3.20.1 */
 
     const file$1 = "src/Checkbox.svelte";
 
     function create_fragment$1(ctx) {
-    	var div1, div0, t_value = ctx.checked?"✓":"" + "", t, dispose;
+    	let div1;
+    	let div0;
+    	let t_value = (/*checked*/ ctx[0] ? "✓" : "") + "";
+    	let t;
+    	let dispose;
 
     	const block = {
     		c: function create() {
@@ -4703,90 +4984,119 @@
     			set_style(div1, "top", "3px");
     			set_style(div1, "width", "13px");
     			set_style(div1, "height", "13px");
-    			set_style(div1, "background-color", (ctx.checked ? ctx.color:'white'));
+    			set_style(div1, "background-color", /*checked*/ ctx[0] ? /*color*/ ctx[1] : "white");
     			set_style(div1, "border-radius", "3px");
     			set_style(div1, "opacity", "0.8");
-    			set_style(div1, "border", "2px solid " + (ctx.checked ? 'rgba(255,255,255,0)':ctx.color));
+
+    			set_style(div1, "border", "2px solid " + (/*checked*/ ctx[0]
+    			? "rgba(255,255,255,0)"
+    			: /*color*/ ctx[1]));
+
     			set_style(div1, "box-shadow", "inset 1px 1px 3px rgba(0, 0, 0, 0.1)");
     			set_style(div1, "user-select", "none");
     			add_location(div1, file$1, 6, 0, 101);
-    			dispose = listen_dev(div1, "click", ctx.click_handler);
     		},
-
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
-
-    		m: function mount(target, anchor) {
+    		m: function mount(target, anchor, remount) {
     			insert_dev(target, div1, anchor);
     			append_dev(div1, div0);
     			append_dev(div0, t);
+    			if (remount) dispose();
+    			dispose = listen_dev(div1, "click", /*click_handler*/ ctx[3], false, false, false);
     		},
+    		p: function update(ctx, [dirty]) {
+    			if (dirty & /*checked*/ 1 && t_value !== (t_value = (/*checked*/ ctx[0] ? "✓" : "") + "")) set_data_dev(t, t_value);
 
-    		p: function update(changed, ctx) {
-    			if ((changed.checked) && t_value !== (t_value = ctx.checked?"✓":"" + "")) {
-    				set_data_dev(t, t_value);
+    			if (dirty & /*checked, color*/ 3) {
+    				set_style(div1, "background-color", /*checked*/ ctx[0] ? /*color*/ ctx[1] : "white");
     			}
 
-    			if (changed.checked || changed.color) {
-    				set_style(div1, "background-color", (ctx.checked ? ctx.color:'white'));
-    				set_style(div1, "border", "2px solid " + (ctx.checked ? 'rgba(255,255,255,0)':ctx.color));
+    			if (dirty & /*checked, color*/ 3) {
+    				set_style(div1, "border", "2px solid " + (/*checked*/ ctx[0]
+    				? "rgba(255,255,255,0)"
+    				: /*color*/ ctx[1]));
     			}
     		},
-
     		i: noop,
     		o: noop,
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div1);
-    			}
-
+    			if (detaching) detach_dev(div1);
     			dispose();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$1.name, type: "component", source: "", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$1.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
     	return block;
     }
 
     function instance$1($$self, $$props, $$invalidate) {
-    	let { color, checked = false, callback = () => {} } = $$props;
+    	let { color } = $$props;
+    	let { checked = false } = $$props;
 
-    	const writable_props = ['color', 'checked', 'callback'];
+    	let { callback = () => {
+    		
+    	} } = $$props;
+
+    	const writable_props = ["color", "checked", "callback"];
+
     	Object.keys($$props).forEach(key => {
-    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Checkbox> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Checkbox> was created with unknown prop '${key}'`);
     	});
 
-    	const click_handler = () => {$$invalidate('checked', checked = !checked); callback(checked);};
+    	let { $$slots = {}, $$scope } = $$props;
+    	validate_slots("Checkbox", $$slots, []);
+
+    	const click_handler = () => {
+    		$$invalidate(0, checked = !checked);
+    		callback(checked);
+    	};
 
     	$$self.$set = $$props => {
-    		if ('color' in $$props) $$invalidate('color', color = $$props.color);
-    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
-    		if ('callback' in $$props) $$invalidate('callback', callback = $$props.callback);
+    		if ("color" in $$props) $$invalidate(1, color = $$props.color);
+    		if ("checked" in $$props) $$invalidate(0, checked = $$props.checked);
+    		if ("callback" in $$props) $$invalidate(2, callback = $$props.callback);
     	};
 
-    	$$self.$capture_state = () => {
-    		return { color, checked, callback };
-    	};
+    	$$self.$capture_state = () => ({ color, checked, callback });
 
     	$$self.$inject_state = $$props => {
-    		if ('color' in $$props) $$invalidate('color', color = $$props.color);
-    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
-    		if ('callback' in $$props) $$invalidate('callback', callback = $$props.callback);
+    		if ("color" in $$props) $$invalidate(1, color = $$props.color);
+    		if ("checked" in $$props) $$invalidate(0, checked = $$props.checked);
+    		if ("callback" in $$props) $$invalidate(2, callback = $$props.callback);
     	};
 
-    	return { color, checked, callback, click_handler };
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	return [checked, color, callback, click_handler];
     }
 
     class Checkbox extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, ["color", "checked", "callback"]);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Checkbox", options, id: create_fragment$1.name });
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { color: 1, checked: 0, callback: 2 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Checkbox",
+    			options,
+    			id: create_fragment$1.name
+    		});
 
     		const { ctx } = this.$$;
     		const props = options.props || {};
-    		if (ctx.color === undefined && !('color' in props)) {
+
+    		if (/*color*/ ctx[1] === undefined && !("color" in props)) {
     			console.warn("<Checkbox> was created without expected prop 'color'");
     		}
     	}
@@ -4816,12 +5126,24 @@
     	}
     }
 
-    /* src/Arrow.svelte generated by Svelte v3.12.1 */
+    /* src/Arrow.svelte generated by Svelte v3.20.1 */
 
     const file$2 = "src/Arrow.svelte";
 
     function create_fragment$2(ctx) {
-    	var svg0, defs0, marker0, path, defs1, marker1, circle, t, div, svg1, line, line_y__value, line_marker_end_value;
+    	let svg0;
+    	let defs0;
+    	let marker0;
+    	let path;
+    	let defs1;
+    	let marker1;
+    	let circle;
+    	let t;
+    	let div;
+    	let svg1;
+    	let line;
+    	let line_y__value;
+    	let line_marker_end_value;
 
     	const block = {
     		c: function create() {
@@ -4870,18 +5192,18 @@
     			attr_dev(line, "x1", "8");
     			attr_dev(line, "y1", "0");
     			attr_dev(line, "x2", "8");
-    			attr_dev(line, "y2", line_y__value = ctx.height-5);
+    			attr_dev(line, "y2", line_y__value = /*height*/ ctx[0] - 5);
     			attr_dev(line, "stroke", "grey");
     			attr_dev(line, "stroke-width", "1.5");
-    			attr_dev(line, "marker-end", line_marker_end_value = "url(" + ctx.arrowhead + ")");
-    			attr_dev(line, "stroke-dasharray", ctx.dasharray);
+    			attr_dev(line, "marker-end", line_marker_end_value = "url(" + /*arrowhead*/ ctx[1] + ")");
+    			attr_dev(line, "stroke-dasharray", /*dasharray*/ ctx[2]);
     			add_location(line, file$2, 39, 2, 892);
     			add_location(svg1, file$2, 38, 0, 884);
     			set_style(div, "position", "absolute");
     			set_style(div, "left", "-1px");
     			set_style(div, "top", "4px");
     			set_style(div, "width", "15px");
-    			set_style(div, "height", "" + ctx.height + "px");
+    			set_style(div, "height", /*height*/ ctx[0] + "px");
     			set_style(div, "background-color", "none");
     			set_style(div, "border-radius", "5px");
     			set_style(div, "top", "25px");
@@ -4889,11 +5211,9 @@
     			set_style(div, "pointer-events", "None");
     			add_location(div, file$2, 37, 0, 707);
     		},
-
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, svg0, anchor);
     			append_dev(svg0, defs0);
@@ -4907,76 +5227,93 @@
     			append_dev(div, svg1);
     			append_dev(svg1, line);
     		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.height) && line_y__value !== (line_y__value = ctx.height-5)) {
+    		p: function update(ctx, [dirty]) {
+    			if (dirty & /*height*/ 1 && line_y__value !== (line_y__value = /*height*/ ctx[0] - 5)) {
     				attr_dev(line, "y2", line_y__value);
     			}
 
-    			if ((changed.arrowhead) && line_marker_end_value !== (line_marker_end_value = "url(" + ctx.arrowhead + ")")) {
+    			if (dirty & /*arrowhead*/ 2 && line_marker_end_value !== (line_marker_end_value = "url(" + /*arrowhead*/ ctx[1] + ")")) {
     				attr_dev(line, "marker-end", line_marker_end_value);
     			}
 
-    			if (changed.dasharray) {
-    				attr_dev(line, "stroke-dasharray", ctx.dasharray);
+    			if (dirty & /*dasharray*/ 4) {
+    				attr_dev(line, "stroke-dasharray", /*dasharray*/ ctx[2]);
     			}
 
-    			if (changed.height) {
-    				set_style(div, "height", "" + ctx.height + "px");
+    			if (dirty & /*height*/ 1) {
+    				set_style(div, "height", /*height*/ ctx[0] + "px");
     			}
     		},
-
     		i: noop,
     		o: noop,
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(svg0);
-    				detach_dev(t);
-    				detach_dev(div);
-    			}
+    			if (detaching) detach_dev(svg0);
+    			if (detaching) detach_dev(t);
+    			if (detaching) detach_dev(div);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$2.name, type: "component", source: "", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$2.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
     	return block;
     }
 
     function instance$2($$self, $$props, $$invalidate) {
-    	let { height, arrowhead = "#arrow", dasharray = "0 0" } = $$props;
+    	let { height } = $$props;
+    	let { arrowhead = "#arrow" } = $$props;
+    	let { dasharray = "0 0" } = $$props;
+    	const writable_props = ["height", "arrowhead", "dasharray"];
 
-    	const writable_props = ['height', 'arrowhead', 'dasharray'];
     	Object.keys($$props).forEach(key => {
-    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Arrow> was created with unknown prop '${key}'`);
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Arrow> was created with unknown prop '${key}'`);
     	});
 
+    	let { $$slots = {}, $$scope } = $$props;
+    	validate_slots("Arrow", $$slots, []);
+
     	$$self.$set = $$props => {
-    		if ('height' in $$props) $$invalidate('height', height = $$props.height);
-    		if ('arrowhead' in $$props) $$invalidate('arrowhead', arrowhead = $$props.arrowhead);
-    		if ('dasharray' in $$props) $$invalidate('dasharray', dasharray = $$props.dasharray);
+    		if ("height" in $$props) $$invalidate(0, height = $$props.height);
+    		if ("arrowhead" in $$props) $$invalidate(1, arrowhead = $$props.arrowhead);
+    		if ("dasharray" in $$props) $$invalidate(2, dasharray = $$props.dasharray);
     	};
 
-    	$$self.$capture_state = () => {
-    		return { height, arrowhead, dasharray };
-    	};
+    	$$self.$capture_state = () => ({ height, arrowhead, dasharray });
 
     	$$self.$inject_state = $$props => {
-    		if ('height' in $$props) $$invalidate('height', height = $$props.height);
-    		if ('arrowhead' in $$props) $$invalidate('arrowhead', arrowhead = $$props.arrowhead);
-    		if ('dasharray' in $$props) $$invalidate('dasharray', dasharray = $$props.dasharray);
+    		if ("height" in $$props) $$invalidate(0, height = $$props.height);
+    		if ("arrowhead" in $$props) $$invalidate(1, arrowhead = $$props.arrowhead);
+    		if ("dasharray" in $$props) $$invalidate(2, dasharray = $$props.dasharray);
     	};
 
-    	return { height, arrowhead, dasharray };
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	return [height, arrowhead, dasharray];
     }
 
     class Arrow extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, ["height", "arrowhead", "dasharray"]);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Arrow", options, id: create_fragment$2.name });
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { height: 0, arrowhead: 1, dasharray: 2 });
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "Arrow",
+    			options,
+    			id: create_fragment$2.name
+    		});
 
     		const { ctx } = this.$$;
     		const props = options.props || {};
-    		if (ctx.height === undefined && !('height' in props)) {
+
+    		if (/*height*/ ctx[0] === undefined && !("height" in props)) {
     			console.warn("<Arrow> was created without expected prop 'height'");
     		}
     	}
@@ -22424,19 +22761,22 @@
 
     var katex$1 = unwrapExports(katex);
 
-    /* src/App.svelte generated by Svelte v3.12.1 */
-
+    /* src/App.svelte generated by Svelte v3.20.1 */
     const file$3 = "src/App.svelte";
 
     function get_each_context$1(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.milestone = list[i];
+    	const child_ctx = ctx.slice();
+    	child_ctx[85] = list[i];
     	return child_ctx;
     }
 
     // (792:8) {#if xScaleTime(InterventionTime) >= 100}
     function create_if_block$1(ctx) {
-    	var div, span, t, html_tag, raw_value = math_inline("\\mathcal{R}_0=" + (ctx.R0).toFixed(2) ) + "";
+    	let div;
+    	let span;
+    	let t;
+    	let html_tag;
+    	let raw_value = math_inline("\\mathcal{R}_0=" + /*R0*/ ctx[5].toFixed(2)) + "";
 
     	const block = {
     		c: function create() {
@@ -22453,48 +22793,55 @@
     			set_style(div, "width", "120px");
     			add_location(div, file$3, 792, 10, 26947);
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, div, anchor);
     			append_dev(div, span);
     			append_dev(span, t);
     			html_tag.m(span);
     		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.R0) && raw_value !== (raw_value = math_inline("\\mathcal{R}_0=" + (ctx.R0).toFixed(2) ) + "")) {
-    				html_tag.p(raw_value);
-    			}
+    		p: function update(ctx, dirty) {
+    			if (dirty[0] & /*R0*/ 32 && raw_value !== (raw_value = math_inline("\\mathcal{R}_0=" + /*R0*/ ctx[5].toFixed(2)) + "")) html_tag.p(raw_value);
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div);
-    			}
+    			if (detaching) detach_dev(div);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$1.name, type: "if", source: "(792:8) {#if xScaleTime(InterventionTime) >= 100}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_if_block$1.name,
+    		type: "if",
+    		source: "(792:8) {#if xScaleTime(InterventionTime) >= 100}",
+    		ctx
+    	});
+
     	return block;
     }
 
     // (904:12) {#each milestones as milestone}
     function create_each_block$1(ctx) {
-    	var div1, span, t0, div0, raw_value = ctx.milestone[1] + "", t1, current;
+    	let div1;
+    	let span;
+    	let t0;
+    	let div0;
+    	let raw_value = /*milestone*/ ctx[85][1] + "";
+    	let t1;
+    	let current;
 
-    	var arrow = new Arrow({
-    		props: {
-    		height: "30",
-    		arrowhead: "#circle",
-    		dasharray: "2 1"
-    	},
-    		$$inline: true
-    	});
+    	const arrow = new Arrow({
+    			props: {
+    				height: "30",
+    				arrowhead: "#circle",
+    				dasharray: "2 1"
+    			},
+    			$$inline: true
+    		});
 
     	const block = {
     		c: function create() {
     			div1 = element("div");
     			span = element("span");
-    			arrow.$$.fragment.c();
+    			create_component(arrow.$$.fragment);
     			t0 = space();
     			div0 = element("div");
     			t1 = space();
@@ -22511,11 +22858,10 @@
     			set_style(div0, "padding-right", "4px");
     			add_location(div0, file$3, 906, 18, 32683);
     			set_style(div1, "position", "absolute");
-    			set_style(div1, "left", "" + (ctx.xScaleTime(ctx.milestone[0])+8) + "px");
+    			set_style(div1, "left", /*xScaleTime*/ ctx[27](/*milestone*/ ctx[85][0]) + 8 + "px");
     			set_style(div1, "top", "-30px");
     			add_location(div1, file$3, 904, 14, 32475);
     		},
-
     		m: function mount(target, anchor) {
     			insert_dev(target, div1, anchor);
     			append_dev(div1, span);
@@ -22526,207 +22872,879 @@
     			append_dev(div1, t1);
     			current = true;
     		},
-
-    		p: function update(changed, ctx) {
-    			if ((!current || changed.milestones) && raw_value !== (raw_value = ctx.milestone[1] + "")) {
-    				div0.innerHTML = raw_value;
-    			}
-
-    			if (!current || changed.xScaleTime || changed.milestones) {
-    				set_style(div1, "left", "" + (ctx.xScaleTime(ctx.milestone[0])+8) + "px");
+    		p: function update(ctx, dirty) {
+    			if ((!current || dirty[1] & /*milestones*/ 8) && raw_value !== (raw_value = /*milestone*/ ctx[85][1] + "")) div0.innerHTML = raw_value;
+    			if (!current || dirty[0] & /*xScaleTime*/ 134217728 | dirty[1] & /*milestones*/ 8) {
+    				set_style(div1, "left", /*xScaleTime*/ ctx[27](/*milestone*/ ctx[85][0]) + 8 + "px");
     			}
     		},
-
     		i: function intro(local) {
     			if (current) return;
     			transition_in(arrow.$$.fragment, local);
-
     			current = true;
     		},
-
     		o: function outro(local) {
     			transition_out(arrow.$$.fragment, local);
     			current = false;
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div1);
-    			}
-
+    			if (detaching) detach_dev(div1);
     			destroy_component(arrow);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block$1.name, type: "each", source: "(904:12) {#each milestones as milestone}", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_each_block$1.name,
+    		type: "each",
+    		source: "(904:12) {#each milestones as milestone}",
+    		ctx
+    	});
+
     	return block;
     }
 
     function create_fragment$3(ctx) {
-    	var link, t0, h2, t2, div75, div50, div49, div0, b0, br0, t4, t5_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "", t5, t6, div7, span0, t7, t8, div5, div1, t10, div4, div2, span1, t12, i0, t13_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][0])) + "", t13, t14, t15_value = (100*ctx.Iters[ctx.active_][0]).toFixed(2) + "", t15, t16, t17, div3, span2, t19, i1, t20_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[0])) + "", t20, t21, t22, div6, t24, div14, updating_checked, t25, t26, div12, div8, t28, div11, div9, span3, t30, i2, t31_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][1])) + "", t31, t32, t33_value = (100*ctx.Iters[ctx.active_][1]).toFixed(2) + "", t33, t34, t35, div10, span4, t37, i3, t38_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[1])) + "", t38, t39, t40, div13, t42, div21, updating_checked_1, t43, t44, div19, div15, t46, div18, div16, span5, t48, i4, t49_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][2])) + "", t49, t50, t51_value = (100*ctx.Iters[ctx.active_][2]).toFixed(2) + "", t51, t52, t53, div17, span6, t55, i5, t56_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[2])) + "", t56, t57, t58, div20, t59, i6, t61, t62, div28, t63, t64, div26, div22, t66, div25, div23, span7, t68, i7, t69_value = formatNumber$1(ctx.Math.round(ctx.N* (1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2])+ctx.I0 )) + "", t69, t70, t71_value = ((100*(1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2]-ctx.I0/ctx.N))).toFixed(2) + "", t71, t72, t73, div24, span8, t75, i8, t76_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[3]+ctx.get_d(ctx.active_)[4]+ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]+ctx.get_d(ctx.active_)[7]) )) + "", t76, t77, t78, div27, t80, div34, updating_checked_2, t81, t82, div32, div29, t84, div31, div30, span9, t86, i9, t87_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8]) )) + "", t87, t88, t89_value = (100*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8])).toFixed(2) + "", t89, t90, t91, div33, t93, div41, t94, updating_checked_3, t95, div39, div35, t97, div37, div36, span10, t99, i10, t100_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6]) )) + "", t100, t101, t102_value = (100*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6])).toFixed(2) + "", t102, t103, t104, div38, span11, t106, i11, t107_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]))) + "", t107, t108, t109, div40, t111, div48, t112, updating_checked_4, t113, div46, div42, t115, div45, div43, span12, t117, i12, t118_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][9])) + "", t118, t119, t120_value = (100*ctx.Iters[ctx.active_][9]).toFixed(2) + "", t120, t121, t122, div44, span13, t124, i13, t125_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[9])) + "", t125, t126, t127, div47, t129, div74, div51, updating_checked_5, updating_active, t130, div52, t131, div53, t132, div61, div60, div54, span14, raw0_value = math_inline("\\mathcal{R}_t=" + (ctx.R0*ctx.InterventionAmt).toFixed(2) ) + "", t133, t134, show_if = ctx.xScaleTime(ctx.InterventionTime) >= 100, t135, div58, div55, t136, t137_value = format("d")(ctx.InterventionTime) + "", t137, t138, span15, div56, t140, div57, svg, g1, g0, path, t141, div59, t142, div69, div68, div67, div66, div63, div62, t143, br1, t144, div65, div64, t145_value = (ctx.InterventionAmt).toFixed(2) + "", t145, t146, input0, t147, div70, t148, div73, div72, updating_checked_6, div71, t150, div117, div79, div76, t152, div77, t153, div78, t155, div116, div85, div80, t157, div81, t158, br2, t159, div82, t160_value = format(",")(ctx.Math.round(ctx.N)) + "", t160, t161, input1, t162, div83, t163, br3, t164, div84, t165, t166, input2, t167, div90, div88, div86, t168, html_tag, raw1_value = math_inline("\\mathcal{R}_0") + "", t169, div87, t170, br4, t171, div89, t172, t173, input3, t174, div96, div91, t176, div92, t177, html_tag_1, raw2_value = math_inline("T_{\\text{inc}}") + "", t178, br5, t179, div93, t180_value = (ctx.D_incbation).toFixed(2) + "", t180, t181, t182, input4, t183, div94, t184, html_tag_2, raw3_value = math_inline("T_{\\text{inf}}") + "", t185, br6, t186, div95, t187, t188, t189, input5, t190, div97, t191, div103, div98, t193, div99, t194, br7, t195, div100, t196_value = (ctx.CFR*100).toFixed(2) + "", t196, t197, t198, input6, t199, div101, t200, br8, t201, div102, t202, t203, t204, input7, input7_min_value, t205, div109, div104, t207, div105, t208, br9, t209, div106, t210, t211, t212, input8, t213, div107, t214, br10, t215, div108, t216, t217, t218, input9, t219, div115, div110, t221, div111, t222, br11, t223, div112, t224_value = (ctx.P_SEVERE*100).toFixed(2) + "", t224, t225, t226, input10, t227, div113, t228, br12, t229, div114, t230, t231, t232, input11, t233, div118, t234, p0, t236, p1, t237, b1, a0, t239, t240, b2, t242, span16, b3, t244, span17, b4, t246, span18, b5, t248, a1, t250, a2, t252, span19, t253, t254, p2, t255, t256_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "", t256, t257, a3, t259, input12, t260, t261_value = ((1-(ctx.Math.pow(1 - (ctx.Iters[ctx.active_][2])*(0.45/100), ctx.p_num_ind)))*100).toFixed(5) + "", t261, t262, a4, t264, t265, p3, t267, div119, table, tr0, th0, t268, th1, t270, th2, t271, br13, t272, html_tag_3, raw5_value = math_inline("\\mathcal{R}_0") + "", t273, th3, t274, br14, t275, html_tag_4, raw6_value = math_inline("T_{\\text{inc}}") + "", t276, t277, th4, t278, br15, t279, html_tag_5, raw7_value = math_inline("T_{\\text{inf}}") + "", t280, t281, tr1, td0, a5, t283, td1, t285, td2, t287, td3, t289, td4, t291, tr2, td5, a6, t293, td6, t295, td7, t297, td8, t299, td9, t301, tr3, td10, a7, t303, td11, t305, td12, t307, td13, t309, td14, t311, tr4, td15, a8, t313, td16, t315, td17, t317, td18, t318, td19, t319, tr5, td20, a9, t321, td21, t323, td22, t325, td23, t327, td24, t328, tr6, td25, a10, t330, td26, t332, td27, t334, td28, t336, td29, t338, tr7, td30, a11, t340, td31, t342, td32, t344, td33, t346, td34, t348, tr8, td35, a12, t350, td36, t352, td37, t353, td38, t355, td39, t356, tr9, td40, a13, t358, td41, t360, td42, t362, td43, t363, td44, t364, tr10, td45, a14, t366, td46, t368, td47, t369, td48, t371, td49, t373, td50, t374, tr11, td51, a15, t376, td52, t378, td53, t380, td54, t381, td55, t382, p4, t383, a16, t385, a17, t387, t388, p5, t389, a18, t391, a19, t393, t394, p6, a20, script, t395, p7, b6, br16, t397, html_tag_6, raw8_value = math_inline("I,R") + "", t398, i14, t400, i15, t402, i16, t404, t405, p8, b7, br17, t407, a21, t409, a22, t411, a23, t413, a24, t415, t416, div122, div121, div120, t418, form, textarea, current, dispose;
-
-    	var checkbox0 = new Checkbox({
-    		props: { color: "#CCC" },
-    		$$inline: true
-    	});
-
-    	var arrow0 = new Arrow({ props: { height: "41" }, $$inline: true });
+    	let link;
+    	let t0;
+    	let h2;
+    	let t2;
+    	let div75;
+    	let div50;
+    	let div49;
+    	let div0;
+    	let b0;
+    	let br0;
+    	let t4;
+    	let t5_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "";
+    	let t5;
+    	let t6;
+    	let div7;
+    	let span0;
+    	let t7;
+    	let t8;
+    	let div5;
+    	let div1;
+    	let t10;
+    	let div4;
+    	let div2;
+    	let span1;
+    	let t12;
+    	let i0;
+    	let t13_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0])) + "";
+    	let t13;
+    	let t14;
+    	let t15_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0]).toFixed(2) + "";
+    	let t15;
+    	let t16;
+    	let t17;
+    	let div3;
+    	let span2;
+    	let t19;
+    	let i1;
+    	let t20_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[0])) + "";
+    	let t20;
+    	let t21;
+    	let t22;
+    	let div6;
+    	let t24;
+    	let div14;
+    	let updating_checked;
+    	let t25;
+    	let t26;
+    	let div12;
+    	let div8;
+    	let t28;
+    	let div11;
+    	let div9;
+    	let span3;
+    	let t30;
+    	let i2;
+    	let t31_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1])) + "";
+    	let t31;
+    	let t32;
+    	let t33_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1]).toFixed(2) + "";
+    	let t33;
+    	let t34;
+    	let t35;
+    	let div10;
+    	let span4;
+    	let t37;
+    	let i3;
+    	let t38_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[1])) + "";
+    	let t38;
+    	let t39;
+    	let t40;
+    	let div13;
+    	let t42;
+    	let div21;
+    	let updating_checked_1;
+    	let t43;
+    	let t44;
+    	let div19;
+    	let div15;
+    	let t46;
+    	let div18;
+    	let div16;
+    	let span5;
+    	let t48;
+    	let i4;
+    	let t49_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2])) + "";
+    	let t49;
+    	let t50;
+    	let t51_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]).toFixed(2) + "";
+    	let t51;
+    	let t52;
+    	let t53;
+    	let div17;
+    	let span6;
+    	let t55;
+    	let i5;
+    	let t56_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[2])) + "";
+    	let t56;
+    	let t57;
+    	let t58;
+    	let div20;
+    	let t59;
+    	let i6;
+    	let t61;
+    	let t62;
+    	let div28;
+    	let t63;
+    	let t64;
+    	let div26;
+    	let div22;
+    	let t66;
+    	let div25;
+    	let div23;
+    	let span7;
+    	let t68;
+    	let i7;
+    	let t69_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]) + /*I0*/ ctx[4])) + "";
+    	let t69;
+    	let t70;
+    	let t71_value = (100 * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] - /*I0*/ ctx[4] / /*N*/ ctx[3])).toFixed(2) + "";
+    	let t71;
+    	let t72;
+    	let t73;
+    	let div24;
+    	let span8;
+    	let t75;
+    	let i8;
+    	let t76_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[3] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[4] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[7]))) + "";
+    	let t76;
+    	let t77;
+    	let t78;
+    	let div27;
+    	let t80;
+    	let div34;
+    	let updating_checked_2;
+    	let t81;
+    	let t82;
+    	let div32;
+    	let div29;
+    	let t84;
+    	let div31;
+    	let div30;
+    	let span9;
+    	let t86;
+    	let i9;
+    	let t87_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8]))) + "";
+    	let t87;
+    	let t88;
+    	let t89_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8])).toFixed(2) + "";
+    	let t89;
+    	let t90;
+    	let t91;
+    	let div33;
+    	let t93;
+    	let div41;
+    	let t94;
+    	let updating_checked_3;
+    	let t95;
+    	let div39;
+    	let div35;
+    	let t97;
+    	let div37;
+    	let div36;
+    	let span10;
+    	let t99;
+    	let i10;
+    	let t100_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6]))) + "";
+    	let t100;
+    	let t101;
+    	let t102_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6])).toFixed(2) + "";
+    	let t102;
+    	let t103;
+    	let t104;
+    	let div38;
+    	let span11;
+    	let t106;
+    	let i11;
+    	let t107_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6]))) + "";
+    	let t107;
+    	let t108;
+    	let t109;
+    	let div40;
+    	let t111;
+    	let div48;
+    	let t112;
+    	let updating_checked_4;
+    	let t113;
+    	let div46;
+    	let div42;
+    	let t115;
+    	let div45;
+    	let div43;
+    	let span12;
+    	let t117;
+    	let i12;
+    	let t118_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9])) + "";
+    	let t118;
+    	let t119;
+    	let t120_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9]).toFixed(2) + "";
+    	let t120;
+    	let t121;
+    	let t122;
+    	let div44;
+    	let span13;
+    	let t124;
+    	let i13;
+    	let t125_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[9])) + "";
+    	let t125;
+    	let t126;
+    	let t127;
+    	let div47;
+    	let t129;
+    	let div74;
+    	let div51;
+    	let updating_checked_5;
+    	let updating_active;
+    	let t130;
+    	let div52;
+    	let t131;
+    	let div53;
+    	let t132;
+    	let div61;
+    	let div60;
+    	let div54;
+    	let span14;
+    	let raw0_value = math_inline("\\mathcal{R}_t=" + (/*R0*/ ctx[5] * /*InterventionAmt*/ ctx[13]).toFixed(2)) + "";
+    	let t133;
+    	let t134;
+    	let show_if = /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 100;
+    	let t135;
+    	let div58;
+    	let div55;
+    	let t136;
+    	let t137_value = format("d")(/*InterventionTime*/ ctx[12]) + "";
+    	let t137;
+    	let t138;
+    	let span15;
+    	let div56;
+    	let t140;
+    	let div57;
+    	let svg;
+    	let g1;
+    	let g0;
+    	let path;
+    	let t141;
+    	let div59;
+    	let t142;
+    	let div69;
+    	let div68;
+    	let div67;
+    	let div66;
+    	let div63;
+    	let div62;
+    	let t143;
+    	let br1;
+    	let t144;
+    	let div65;
+    	let div64;
+    	let t145_value = /*InterventionAmt*/ ctx[13].toFixed(2) + "";
+    	let t145;
+    	let t146;
+    	let input0;
+    	let t147;
+    	let div70;
+    	let t148;
+    	let div73;
+    	let div72;
+    	let updating_checked_6;
+    	let div71;
+    	let t150;
+    	let div117;
+    	let div79;
+    	let div76;
+    	let t152;
+    	let div77;
+    	let t153;
+    	let div78;
+    	let t155;
+    	let div116;
+    	let div85;
+    	let div80;
+    	let t157;
+    	let div81;
+    	let t158;
+    	let br2;
+    	let t159;
+    	let div82;
+    	let t160_value = format(",")(Math.round(/*N*/ ctx[3])) + "";
+    	let t160;
+    	let t161;
+    	let input1;
+    	let input1_min_value;
+    	let t162;
+    	let div83;
+    	let t163;
+    	let br3;
+    	let t164;
+    	let div84;
+    	let t165;
+    	let t166;
+    	let input2;
+    	let input2_min_value;
+    	let t167;
+    	let div90;
+    	let div88;
+    	let div86;
+    	let t168;
+    	let html_tag;
+    	let raw1_value = math_inline("\\mathcal{R}_0") + "";
+    	let t169;
+    	let div87;
+    	let t170;
+    	let br4;
+    	let t171;
+    	let div89;
+    	let t172;
+    	let t173;
+    	let input3;
+    	let t174;
+    	let div96;
+    	let div91;
+    	let t176;
+    	let div92;
+    	let t177;
+    	let html_tag_1;
+    	let raw2_value = math_inline("T_{\\text{inc}}") + "";
+    	let t178;
+    	let br5;
+    	let t179;
+    	let div93;
+    	let t180_value = /*D_incbation*/ ctx[6].toFixed(2) + "";
+    	let t180;
+    	let t181;
+    	let t182;
+    	let input4;
+    	let input4_min_value;
+    	let t183;
+    	let div94;
+    	let t184;
+    	let html_tag_2;
+    	let raw3_value = math_inline("T_{\\text{inf}}") + "";
+    	let t185;
+    	let br6;
+    	let t186;
+    	let div95;
+    	let t187;
+    	let t188;
+    	let t189;
+    	let input5;
+    	let input5_min_value;
+    	let t190;
+    	let div97;
+    	let t191;
+    	let div103;
+    	let div98;
+    	let t193;
+    	let div99;
+    	let t194;
+    	let br7;
+    	let t195;
+    	let div100;
+    	let t196_value = (/*CFR*/ ctx[11] * 100).toFixed(2) + "";
+    	let t196;
+    	let t197;
+    	let t198;
+    	let input6;
+    	let input6_min_value;
+    	let t199;
+    	let div101;
+    	let t200;
+    	let br8;
+    	let t201;
+    	let div102;
+    	let t202;
+    	let t203;
+    	let t204;
+    	let input7;
+    	let input7_min_value;
+    	let t205;
+    	let div109;
+    	let div104;
+    	let t207;
+    	let div105;
+    	let t208;
+    	let br9;
+    	let t209;
+    	let div106;
+    	let t210;
+    	let t211;
+    	let t212;
+    	let input8;
+    	let input8_min_value;
+    	let t213;
+    	let div107;
+    	let t214;
+    	let br10;
+    	let t215;
+    	let div108;
+    	let t216;
+    	let t217;
+    	let t218;
+    	let input9;
+    	let input9_min_value;
+    	let t219;
+    	let div115;
+    	let div110;
+    	let t221;
+    	let div111;
+    	let t222;
+    	let br11;
+    	let t223;
+    	let div112;
+    	let t224_value = (/*P_SEVERE*/ ctx[15] * 100).toFixed(2) + "";
+    	let t224;
+    	let t225;
+    	let t226;
+    	let input10;
+    	let input10_min_value;
+    	let t227;
+    	let div113;
+    	let t228;
+    	let br12;
+    	let t229;
+    	let div114;
+    	let t230;
+    	let t231;
+    	let t232;
+    	let input11;
+    	let input11_min_value;
+    	let t233;
+    	let div118;
+    	let t234;
+    	let p0;
+    	let t236;
+    	let p1;
+    	let t237;
+    	let b1;
+    	let a0;
+    	let t239;
+    	let t240;
+    	let b2;
+    	let t242;
+    	let span16;
+    	let b3;
+    	let t244;
+    	let span17;
+    	let b4;
+    	let t246;
+    	let span18;
+    	let b5;
+    	let t248;
+    	let a1;
+    	let t250;
+    	let a2;
+    	let t252;
+    	let span19;
+    	let t253;
+    	let t254;
+    	let p2;
+    	let t255;
+    	let t256_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "";
+    	let t256;
+    	let t257;
+    	let a3;
+    	let t259;
+    	let input12;
+    	let t260;
+    	let t261_value = ((1 - Math.pow(1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] * (0.45 / 100), /*p_num_ind*/ ctx[32])) * 100).toFixed(5) + "";
+    	let t261;
+    	let t262;
+    	let a4;
+    	let t264;
+    	let t265;
+    	let p3;
+    	let t267;
+    	let div119;
+    	let table;
+    	let tr0;
+    	let th0;
+    	let t268;
+    	let th1;
+    	let t270;
+    	let th2;
+    	let t271;
+    	let br13;
+    	let t272;
+    	let html_tag_3;
+    	let raw5_value = math_inline("\\mathcal{R}_0") + "";
+    	let t273;
+    	let th3;
+    	let t274;
+    	let br14;
+    	let t275;
+    	let html_tag_4;
+    	let raw6_value = math_inline("T_{\\text{inc}}") + "";
+    	let t276;
+    	let t277;
+    	let th4;
+    	let t278;
+    	let br15;
+    	let t279;
+    	let html_tag_5;
+    	let raw7_value = math_inline("T_{\\text{inf}}") + "";
+    	let t280;
+    	let t281;
+    	let tr1;
+    	let td0;
+    	let a5;
+    	let t283;
+    	let td1;
+    	let t285;
+    	let td2;
+    	let t287;
+    	let td3;
+    	let t289;
+    	let td4;
+    	let t291;
+    	let tr2;
+    	let td5;
+    	let a6;
+    	let t293;
+    	let td6;
+    	let t295;
+    	let td7;
+    	let t297;
+    	let td8;
+    	let t299;
+    	let td9;
+    	let t301;
+    	let tr3;
+    	let td10;
+    	let a7;
+    	let t303;
+    	let td11;
+    	let t305;
+    	let td12;
+    	let t307;
+    	let td13;
+    	let t309;
+    	let td14;
+    	let t311;
+    	let tr4;
+    	let td15;
+    	let a8;
+    	let t313;
+    	let td16;
+    	let t315;
+    	let td17;
+    	let t317;
+    	let td18;
+    	let t318;
+    	let td19;
+    	let t319;
+    	let tr5;
+    	let td20;
+    	let a9;
+    	let t321;
+    	let td21;
+    	let t323;
+    	let td22;
+    	let t325;
+    	let td23;
+    	let t327;
+    	let td24;
+    	let t328;
+    	let tr6;
+    	let td25;
+    	let a10;
+    	let t330;
+    	let td26;
+    	let t332;
+    	let td27;
+    	let t334;
+    	let td28;
+    	let t336;
+    	let td29;
+    	let t338;
+    	let tr7;
+    	let td30;
+    	let a11;
+    	let t340;
+    	let td31;
+    	let t342;
+    	let td32;
+    	let t344;
+    	let td33;
+    	let t346;
+    	let td34;
+    	let t348;
+    	let tr8;
+    	let td35;
+    	let a12;
+    	let t350;
+    	let td36;
+    	let t352;
+    	let td37;
+    	let t353;
+    	let td38;
+    	let t355;
+    	let td39;
+    	let t356;
+    	let tr9;
+    	let td40;
+    	let a13;
+    	let t358;
+    	let td41;
+    	let t360;
+    	let td42;
+    	let t362;
+    	let td43;
+    	let t363;
+    	let td44;
+    	let t364;
+    	let tr10;
+    	let td45;
+    	let a14;
+    	let t366;
+    	let td46;
+    	let t368;
+    	let td47;
+    	let t369;
+    	let td48;
+    	let t371;
+    	let td49;
+    	let t373;
+    	let td50;
+    	let t374;
+    	let tr11;
+    	let td51;
+    	let a15;
+    	let t376;
+    	let td52;
+    	let t378;
+    	let td53;
+    	let t380;
+    	let td54;
+    	let t381;
+    	let td55;
+    	let t382;
+    	let p4;
+    	let t383;
+    	let a16;
+    	let t385;
+    	let a17;
+    	let t387;
+    	let t388;
+    	let p5;
+    	let t389;
+    	let a18;
+    	let t391;
+    	let a19;
+    	let t393;
+    	let a20;
+    	let t395;
+    	let t396;
+    	let p6;
+    	let b6;
+    	let br16;
+    	let t398;
+    	let html_tag_6;
+    	let raw8_value = math_inline("I,R") + "";
+    	let t399;
+    	let i14;
+    	let t401;
+    	let i15;
+    	let t403;
+    	let i16;
+    	let t405;
+    	let t406;
+    	let p7;
+    	let b7;
+    	let br17;
+    	let t408;
+    	let a21;
+    	let t410;
+    	let a22;
+    	let t412;
+    	let a23;
+    	let t414;
+    	let a24;
+    	let t416;
+    	let t417;
+    	let div122;
+    	let div121;
+    	let div120;
+    	let t419;
+    	let form;
+    	let textarea;
+    	let current;
+    	let dispose;
+    	const checkbox0 = new Checkbox({ props: { color: "#CCC" }, $$inline: true });
+    	const arrow0 = new Arrow({ props: { height: "41" }, $$inline: true });
 
     	function checkbox1_checked_binding(value) {
-    		ctx.checkbox1_checked_binding.call(null, value);
-    		updating_checked = true;
-    		add_flush_callback(() => updating_checked = false);
+    		/*checkbox1_checked_binding*/ ctx[63].call(null, value);
     	}
 
-    	let checkbox1_props = { color: ctx.colors[4] };
-    	if (ctx.checked[4] !== void 0) {
-    		checkbox1_props.checked = ctx.checked[4];
-    	}
-    	var checkbox1 = new Checkbox({ props: checkbox1_props, $$inline: true });
+    	let checkbox1_props = { color: /*colors*/ ctx[36][4] };
 
-    	binding_callbacks.push(() => bind(checkbox1, 'checked', checkbox1_checked_binding));
-
-    	var arrow1 = new Arrow({ props: { height: "41" }, $$inline: true });
-
-    	function checkbox2_checked_binding(value_1) {
-    		ctx.checkbox2_checked_binding.call(null, value_1);
-    		updating_checked_1 = true;
-    		add_flush_callback(() => updating_checked_1 = false);
+    	if (/*checked*/ ctx[25][4] !== void 0) {
+    		checkbox1_props.checked = /*checked*/ ctx[25][4];
     	}
 
-    	let checkbox2_props = { color: ctx.colors[3] };
-    	if (ctx.checked[3] !== void 0) {
-    		checkbox2_props.checked = ctx.checked[3];
-    	}
-    	var checkbox2 = new Checkbox({ props: checkbox2_props, $$inline: true });
+    	const checkbox1 = new Checkbox({ props: checkbox1_props, $$inline: true });
+    	binding_callbacks.push(() => bind(checkbox1, "checked", checkbox1_checked_binding));
+    	const arrow1 = new Arrow({ props: { height: "41" }, $$inline: true });
 
-    	binding_callbacks.push(() => bind(checkbox2, 'checked', checkbox2_checked_binding));
-
-    	var arrow2 = new Arrow({ props: { height: "41" }, $$inline: true });
-
-    	var checkbox3 = new Checkbox({
-    		props: { color: "grey", callback: ctx.func },
-    		$$inline: true
-    	});
-
-    	var arrow3 = new Arrow({
-    		props: {
-    		height: "56",
-    		arrowhead: "",
-    		dasharray: "3 2"
-    	},
-    		$$inline: true
-    	});
-
-    	function checkbox4_checked_binding(value_2) {
-    		ctx.checkbox4_checked_binding.call(null, value_2);
-    		updating_checked_2 = true;
-    		add_flush_callback(() => updating_checked_2 = false);
+    	function checkbox2_checked_binding(value) {
+    		/*checkbox2_checked_binding*/ ctx[64].call(null, value);
     	}
 
-    	let checkbox4_props = { color: ctx.colors[2] };
-    	if (ctx.checked[2] !== void 0) {
-    		checkbox4_props.checked = ctx.checked[2];
-    	}
-    	var checkbox4 = new Checkbox({ props: checkbox4_props, $$inline: true });
+    	let checkbox2_props = { color: /*colors*/ ctx[36][3] };
 
-    	binding_callbacks.push(() => bind(checkbox4, 'checked', checkbox4_checked_binding));
-
-    	var arrow4 = new Arrow({
-    		props: {
-    		height: "23",
-    		arrowhead: "",
-    		dasharray: "3 2"
-    	},
-    		$$inline: true
-    	});
-
-    	var arrow5 = new Arrow({
-    		props: {
-    		height: "43",
-    		arrowhead: "",
-    		dasharray: "3 2"
-    	},
-    		$$inline: true
-    	});
-
-    	function checkbox5_checked_binding(value_3) {
-    		ctx.checkbox5_checked_binding.call(null, value_3);
-    		updating_checked_3 = true;
-    		add_flush_callback(() => updating_checked_3 = false);
+    	if (/*checked*/ ctx[25][3] !== void 0) {
+    		checkbox2_props.checked = /*checked*/ ctx[25][3];
     	}
 
-    	let checkbox5_props = { color: ctx.colors[1] };
-    	if (ctx.checked[1] !== void 0) {
-    		checkbox5_props.checked = ctx.checked[1];
-    	}
-    	var checkbox5 = new Checkbox({ props: checkbox5_props, $$inline: true });
+    	const checkbox2 = new Checkbox({ props: checkbox2_props, $$inline: true });
+    	binding_callbacks.push(() => bind(checkbox2, "checked", checkbox2_checked_binding));
+    	const arrow2 = new Arrow({ props: { height: "41" }, $$inline: true });
 
-    	binding_callbacks.push(() => bind(checkbox5, 'checked', checkbox5_checked_binding));
+    	const checkbox3 = new Checkbox({
+    			props: {
+    				color: "grey",
+    				callback: /*func*/ ctx[65]
+    			},
+    			$$inline: true
+    		});
 
-    	var arrow6 = new Arrow({
-    		props: {
-    		height: "40",
-    		arrowhead: "",
-    		dasharray: "3 2"
-    	},
-    		$$inline: true
-    	});
+    	const arrow3 = new Arrow({
+    			props: {
+    				height: "56",
+    				arrowhead: "",
+    				dasharray: "3 2"
+    			},
+    			$$inline: true
+    		});
 
-    	function checkbox6_checked_binding(value_4) {
-    		ctx.checkbox6_checked_binding.call(null, value_4);
-    		updating_checked_4 = true;
-    		add_flush_callback(() => updating_checked_4 = false);
-    	}
-
-    	let checkbox6_props = { color: ctx.colors[0] };
-    	if (ctx.checked[0] !== void 0) {
-    		checkbox6_props.checked = ctx.checked[0];
-    	}
-    	var checkbox6 = new Checkbox({ props: checkbox6_props, $$inline: true });
-
-    	binding_callbacks.push(() => bind(checkbox6, 'checked', checkbox6_checked_binding));
-
-    	function chart_checked_binding(value_5) {
-    		ctx.chart_checked_binding.call(null, value_5);
-    		updating_checked_5 = true;
-    		add_flush_callback(() => updating_checked_5 = false);
+    	function checkbox4_checked_binding(value) {
+    		/*checkbox4_checked_binding*/ ctx[66].call(null, value);
     	}
 
-    	function chart_active_binding(value_6) {
-    		ctx.chart_active_binding.call(null, value_6);
-    		updating_active = true;
-    		add_flush_callback(() => updating_active = false);
+    	let checkbox4_props = { color: /*colors*/ ctx[36][2] };
+
+    	if (/*checked*/ ctx[25][2] !== void 0) {
+    		checkbox4_props.checked = /*checked*/ ctx[25][2];
+    	}
+
+    	const checkbox4 = new Checkbox({ props: checkbox4_props, $$inline: true });
+    	binding_callbacks.push(() => bind(checkbox4, "checked", checkbox4_checked_binding));
+
+    	const arrow4 = new Arrow({
+    			props: {
+    				height: "23",
+    				arrowhead: "",
+    				dasharray: "3 2"
+    			},
+    			$$inline: true
+    		});
+
+    	const arrow5 = new Arrow({
+    			props: {
+    				height: "43",
+    				arrowhead: "",
+    				dasharray: "3 2"
+    			},
+    			$$inline: true
+    		});
+
+    	function checkbox5_checked_binding(value) {
+    		/*checkbox5_checked_binding*/ ctx[67].call(null, value);
+    	}
+
+    	let checkbox5_props = { color: /*colors*/ ctx[36][1] };
+
+    	if (/*checked*/ ctx[25][1] !== void 0) {
+    		checkbox5_props.checked = /*checked*/ ctx[25][1];
+    	}
+
+    	const checkbox5 = new Checkbox({ props: checkbox5_props, $$inline: true });
+    	binding_callbacks.push(() => bind(checkbox5, "checked", checkbox5_checked_binding));
+
+    	const arrow6 = new Arrow({
+    			props: {
+    				height: "40",
+    				arrowhead: "",
+    				dasharray: "3 2"
+    			},
+    			$$inline: true
+    		});
+
+    	function checkbox6_checked_binding(value) {
+    		/*checkbox6_checked_binding*/ ctx[68].call(null, value);
+    	}
+
+    	let checkbox6_props = { color: /*colors*/ ctx[36][0] };
+
+    	if (/*checked*/ ctx[25][0] !== void 0) {
+    		checkbox6_props.checked = /*checked*/ ctx[25][0];
+    	}
+
+    	const checkbox6 = new Checkbox({ props: checkbox6_props, $$inline: true });
+    	binding_callbacks.push(() => bind(checkbox6, "checked", checkbox6_checked_binding));
+
+    	function chart_checked_binding(value) {
+    		/*chart_checked_binding*/ ctx[69].call(null, value);
+    	}
+
+    	function chart_active_binding(value) {
+    		/*chart_active_binding*/ ctx[70].call(null, value);
     	}
 
     	let chart_props = {
-    		y: ctx.P,
-    		xmax: ctx.Xmax,
-    		total_infected: ctx.total_infected,
-    		deaths: ctx.deaths,
-    		total: ctx.total,
-    		timestep: ctx.timestep,
-    		tmax: ctx.tmax,
-    		N: ctx.N,
-    		ymax: ctx.lock ? ctx.Plock: ctx.Pmax,
-    		InterventionTime: ctx.InterventionTime,
-    		colors: ctx.colors,
-    		log: !ctx.log
+    		y: /*P*/ ctx[17],
+    		xmax: /*Xmax*/ ctx[14],
+    		total_infected: /*total_infected*/ ctx[22],
+    		deaths: /*deaths*/ ctx[20],
+    		total: /*total*/ ctx[21],
+    		timestep: /*timestep*/ ctx[18],
+    		tmax: /*tmax*/ ctx[19],
+    		N: /*N*/ ctx[3],
+    		ymax: /*lock*/ ctx[26] ? /*Plock*/ ctx[0] : /*Pmax*/ ctx[24],
+    		InterventionTime: /*InterventionTime*/ ctx[12],
+    		colors: /*colors*/ ctx[36],
+    		log: !/*log*/ ctx[35]
     	};
-    	if (ctx.checked !== void 0) {
-    		chart_props.checked = ctx.checked;
+
+    	if (/*checked*/ ctx[25] !== void 0) {
+    		chart_props.checked = /*checked*/ ctx[25];
     	}
-    	if (ctx.active !== void 0) {
-    		chart_props.active = ctx.active;
+
+    	if (/*active*/ ctx[29] !== void 0) {
+    		chart_props.active = /*active*/ ctx[29];
     	}
-    	var chart = new Chart({ props: chart_props, $$inline: true });
 
-    	binding_callbacks.push(() => bind(chart, 'checked', chart_checked_binding));
-    	binding_callbacks.push(() => bind(chart, 'active', chart_active_binding));
-
-    	var if_block = (show_if) && create_if_block$1(ctx);
-
-    	let each_value = ctx.milestones;
-
+    	const chart = new Chart({ props: chart_props, $$inline: true });
+    	binding_callbacks.push(() => bind(chart, "checked", chart_checked_binding));
+    	binding_callbacks.push(() => bind(chart, "active", chart_active_binding));
+    	let if_block = show_if && create_if_block$1(ctx);
+    	let each_value = /*milestones*/ ctx[34];
+    	validate_each_argument(each_value);
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
@@ -22737,19 +23755,18 @@
     		each_blocks[i] = null;
     	});
 
-    	function checkbox7_checked_binding(value_7) {
-    		ctx.checkbox7_checked_binding.call(null, value_7);
-    		updating_checked_6 = true;
-    		add_flush_callback(() => updating_checked_6 = false);
+    	function checkbox7_checked_binding(value) {
+    		/*checkbox7_checked_binding*/ ctx[72].call(null, value);
     	}
 
     	let checkbox7_props = { color: "#CCC" };
-    	if (ctx.log !== void 0) {
-    		checkbox7_props.checked = ctx.log;
-    	}
-    	var checkbox7 = new Checkbox({ props: checkbox7_props, $$inline: true });
 
-    	binding_callbacks.push(() => bind(checkbox7, 'checked', checkbox7_checked_binding));
+    	if (/*log*/ ctx[35] !== void 0) {
+    		checkbox7_props.checked = /*log*/ ctx[35];
+    	}
+
+    	const checkbox7 = new Checkbox({ props: checkbox7_props, $$inline: true });
+    	binding_callbacks.push(() => bind(checkbox7, "checked", checkbox7_checked_binding));
 
     	const block = {
     		c: function create() {
@@ -22770,9 +23787,9 @@
     			t6 = space();
     			div7 = element("div");
     			span0 = element("span");
-    			checkbox0.$$.fragment.c();
+    			create_component(checkbox0.$$.fragment);
     			t7 = space();
-    			arrow0.$$.fragment.c();
+    			create_component(arrow0.$$.fragment);
     			t8 = space();
     			div5 = element("div");
     			div1 = element("div");
@@ -22801,9 +23818,9 @@
     			div6.textContent = "Population not immune to disease.";
     			t24 = space();
     			div14 = element("div");
-    			checkbox1.$$.fragment.c();
+    			create_component(checkbox1.$$.fragment);
     			t25 = space();
-    			arrow1.$$.fragment.c();
+    			create_component(arrow1.$$.fragment);
     			t26 = space();
     			div12 = element("div");
     			div8 = element("div");
@@ -22832,9 +23849,9 @@
     			div13.textContent = "Population currently in incubation.";
     			t42 = space();
     			div21 = element("div");
-    			checkbox2.$$.fragment.c();
+    			create_component(checkbox2.$$.fragment);
     			t43 = space();
-    			arrow2.$$.fragment.c();
+    			create_component(arrow2.$$.fragment);
     			t44 = space();
     			div19 = element("div");
     			div15 = element("div");
@@ -22866,9 +23883,9 @@
     			t61 = text(" circulating.");
     			t62 = space();
     			div28 = element("div");
-    			checkbox3.$$.fragment.c();
+    			create_component(checkbox3.$$.fragment);
     			t63 = space();
-    			arrow3.$$.fragment.c();
+    			create_component(arrow3.$$.fragment);
     			t64 = space();
     			div26 = element("div");
     			div22 = element("div");
@@ -22897,9 +23914,9 @@
     			div27.textContent = "Population no longer infectious due to isolation or immunity.";
     			t80 = space();
     			div34 = element("div");
-    			checkbox4.$$.fragment.c();
+    			create_component(checkbox4.$$.fragment);
     			t81 = space();
-    			arrow4.$$.fragment.c();
+    			create_component(arrow4.$$.fragment);
     			t82 = space();
     			div32 = element("div");
     			div29 = element("div");
@@ -22920,9 +23937,9 @@
     			div33.textContent = "Full recoveries.";
     			t93 = space();
     			div41 = element("div");
-    			arrow5.$$.fragment.c();
+    			create_component(arrow5.$$.fragment);
     			t94 = space();
-    			checkbox5.$$.fragment.c();
+    			create_component(checkbox5.$$.fragment);
     			t95 = space();
     			div39 = element("div");
     			div35 = element("div");
@@ -22951,9 +23968,9 @@
     			div40.textContent = "Active hospitalizations.";
     			t111 = space();
     			div48 = element("div");
-    			arrow6.$$.fragment.c();
+    			create_component(arrow6.$$.fragment);
     			t112 = space();
-    			checkbox6.$$.fragment.c();
+    			create_component(checkbox6.$$.fragment);
     			t113 = space();
     			div46 = element("div");
     			div42 = element("div");
@@ -22983,7 +24000,7 @@
     			t129 = space();
     			div74 = element("div");
     			div51 = element("div");
-    			chart.$$.fragment.c();
+    			create_component(chart.$$.fragment);
     			t130 = space();
     			div52 = element("div");
     			t131 = space();
@@ -23038,7 +24055,7 @@
     			t148 = space();
     			div73 = element("div");
     			div72 = element("div");
-    			checkbox7.$$.fragment.c();
+    			create_component(checkbox7.$$.fragment);
     			div71 = element("div");
     			div71.textContent = "linear scale";
     			t150 = space();
@@ -23071,7 +24088,7 @@
     			br3 = element("br");
     			t164 = space();
     			div84 = element("div");
-    			t165 = text(ctx.I0);
+    			t165 = text(/*I0*/ ctx[4]);
     			t166 = space();
     			input2 = element("input");
     			t167 = space();
@@ -23085,7 +24102,7 @@
     			br4 = element("br");
     			t171 = space();
     			div89 = element("div");
-    			t172 = text(ctx.R0);
+    			t172 = text(/*R0*/ ctx[5]);
     			t173 = space();
     			input3 = element("input");
     			t174 = space();
@@ -23110,7 +24127,7 @@
     			br6 = element("br");
     			t186 = space();
     			div95 = element("div");
-    			t187 = text(ctx.D_infectious);
+    			t187 = text(/*D_infectious*/ ctx[7]);
     			t188 = text(" Days");
     			t189 = space();
     			input5 = element("input");
@@ -23136,7 +24153,7 @@
     			br8 = element("br");
     			t201 = space();
     			div102 = element("div");
-    			t202 = text(ctx.Time_to_death);
+    			t202 = text(/*Time_to_death*/ ctx[1]);
     			t203 = text(" Days");
     			t204 = space();
     			input7 = element("input");
@@ -23150,7 +24167,7 @@
     			br9 = element("br");
     			t209 = space();
     			div106 = element("div");
-    			t210 = text(ctx.D_recovery_severe);
+    			t210 = text(/*D_recovery_severe*/ ctx[9]);
     			t211 = text(" Days");
     			t212 = space();
     			input8 = element("input");
@@ -23160,7 +24177,7 @@
     			br10 = element("br");
     			t215 = space();
     			div108 = element("div");
-    			t216 = text(ctx.D_recovery_mild);
+    			t216 = text(/*D_recovery_mild*/ ctx[8]);
     			t217 = text(" Days");
     			t218 = space();
     			input9 = element("input");
@@ -23184,7 +24201,7 @@
     			br12 = element("br");
     			t229 = space();
     			div114 = element("div");
-    			t230 = text(ctx.D_hospital_lag);
+    			t230 = text(/*D_hospital_lag*/ ctx[10]);
     			t231 = text(" Days");
     			t232 = space();
     			input11 = element("input");
@@ -23463,51 +24480,50 @@
     			t391 = text(" or email me ");
     			a19 = element("a");
     			a19.textContent = "here";
-    			t393 = text(".");
-    			t394 = space();
-    			p6 = element("p");
+    			t393 = text(". My ");
     			a20 = element("a");
-    			script = element("script");
-    			t395 = space();
-    			p7 = element("p");
+    			a20.textContent = "website";
+    			t395 = text(".");
+    			t396 = space();
+    			p6 = element("p");
     			b6 = element("b");
     			b6.textContent = "Model Details ";
     			br16 = element("br");
-    			t397 = text("\nThe clinical dynamics in this model are an elaboration on SEIR that simulates the disease's progression at a higher resolution, subdividing ");
-    			t398 = text(" into ");
+    			t398 = text("\nThe clinical dynamics in this model are an elaboration on SEIR that simulates the disease's progression at a higher resolution, subdividing ");
+    			t399 = text(" into ");
     			i14 = element("i");
     			i14.textContent = "mild";
-    			t400 = text(" (patients who recover without the need for hospitalization), ");
+    			t401 = text(" (patients who recover without the need for hospitalization), ");
     			i15 = element("i");
     			i15.textContent = "moderate";
-    			t402 = text(" (patients who require hospitalization but survive) and ");
+    			t403 = text(" (patients who require hospitalization but survive) and ");
     			i16 = element("i");
     			i16.textContent = "fatal";
-    			t404 = text(" (patients who require hospitalization and do not survive). Each of these variables follows its own trajectory to the final outcome, and the sum of these compartments add up to the values predicted by SEIR. Please refer to the source code for details. Note that we assume, for simplicity, that all fatalities come from hospitals, and that all fatal cases are admitted to hospitals immediately after the infectious period.");
-    			t405 = space();
-    			p8 = element("p");
+    			t405 = text(" (patients who require hospitalization and do not survive). Each of these variables follows its own trajectory to the final outcome, and the sum of these compartments add up to the values predicted by SEIR. Please refer to the source code for details. Note that we assume, for simplicity, that all fatalities come from hospitals, and that all fatal cases are admitted to hospitals immediately after the infectious period.");
+    			t406 = space();
+    			p7 = element("p");
     			b7 = element("b");
     			b7.textContent = "Acknowledgements ";
     			br17 = element("br");
-    			t407 = space();
+    			t408 = space();
     			a21 = element("a");
     			a21.textContent = "Steven De Keninck";
-    			t409 = text(" for RK4 Integrator. ");
+    			t410 = text(" for RK4 Integrator. ");
     			a22 = element("a");
     			a22.textContent = "Chris Olah";
-    			t411 = text(", ");
+    			t412 = text(", ");
     			a23 = element("a");
     			a23.textContent = "Shan Carter";
-    			t413 = text(" and ");
+    			t414 = text(" and ");
     			a24 = element("a");
     			a24.textContent = "Ludwig Schubert";
-    			t415 = text(" wonderful feedback. Charlie Huang for context and discussion.");
-    			t416 = space();
+    			t416 = text(" wonderful feedback. Charlie Huang for context and discussion.");
+    			t417 = space();
     			div122 = element("div");
     			div121 = element("div");
     			div120 = element("div");
     			div120.textContent = "Export parameters:";
-    			t418 = space();
+    			t419 = space();
     			form = element("form");
     			textarea = element("textarea");
     			attr_dev(link, "rel", "stylesheet");
@@ -23598,7 +24614,7 @@
     			add_location(div13, file$3, 635, 8, 19018);
     			set_style(div14, "position", "absolute");
     			set_style(div14, "left", "0px");
-    			set_style(div14, "top", "" + legendheight*1 + "px");
+    			set_style(div14, "top", legendheight * 1 + "px");
     			set_style(div14, "width", "180px");
     			set_style(div14, "height", "100px");
     			add_location(div14, file$3, 620, 6, 18164);
@@ -23634,7 +24650,7 @@
     			add_location(div20, file$3, 654, 8, 20062);
     			set_style(div21, "position", "absolute");
     			set_style(div21, "left", "0px");
-    			set_style(div21, "top", "" + legendheight*2 + "px");
+    			set_style(div21, "top", legendheight * 2 + "px");
     			set_style(div21, "width", "180px");
     			set_style(div21, "height", "100px");
     			add_location(div21, file$3, 640, 6, 19211);
@@ -23669,7 +24685,7 @@
     			add_location(div27, file$3, 674, 8, 21348);
     			set_style(div28, "position", "absolute");
     			set_style(div28, "left", "0px");
-    			set_style(div28, "top", "" + legendheight*3 + "px");
+    			set_style(div28, "top", legendheight * 3 + "px");
     			set_style(div28, "width", "180px");
     			set_style(div28, "height", "100px");
     			add_location(div28, file$3, 660, 6, 20269);
@@ -23697,7 +24713,7 @@
     			add_location(div33, file$3, 690, 8, 22282);
     			set_style(div34, "position", "absolute");
     			set_style(div34, "left", "0px");
-    			set_style(div34, "top", "" + (legendheight*4+14-3) + "px");
+    			set_style(div34, "top", legendheight * 4 + 14 - 3 + "px");
     			set_style(div34, "width", "180px");
     			set_style(div34, "height", "100px");
     			add_location(div34, file$3, 679, 6, 21567);
@@ -23732,7 +24748,7 @@
     			add_location(div40, file$3, 707, 8, 23403);
     			set_style(div41, "position", "absolute");
     			set_style(div41, "left", "0px");
-    			set_style(div41, "top", "" + (legendheight*4+57) + "px");
+    			set_style(div41, "top", legendheight * 4 + 57 + "px");
     			set_style(div41, "width", "180px");
     			set_style(div41, "height", "100px");
     			add_location(div41, file$3, 695, 6, 22460);
@@ -23767,7 +24783,7 @@
     			add_location(div47, file$3, 725, 8, 24459);
     			set_style(div48, "position", "absolute");
     			set_style(div48, "left", "0px");
-    			set_style(div48, "top", "" + (legendheight*4 + 120+2) + "px");
+    			set_style(div48, "top", legendheight * 4 + 120 + 2 + "px");
     			set_style(div48, "width", "180px");
     			set_style(div48, "height", "100px");
     			add_location(div48, file$3, 711, 6, 23562);
@@ -23785,9 +24801,9 @@
     			attr_dev(div52, "id", "xAxisDrag");
     			set_style(div52, "pointer-events", "all");
     			set_style(div52, "position", "absolute");
-    			set_style(div52, "top", "" + (height$1+80) + "px");
-    			set_style(div52, "left", "" + 0 + "px");
-    			set_style(div52, "width", "" + 780 + "px");
+    			set_style(div52, "top", /*height*/ ctx[40] + 80 + "px");
+    			set_style(div52, "left", 0 + "px");
+    			set_style(div52, "width", 780 + "px");
     			set_style(div52, "background-color", "#222");
     			set_style(div52, "opacity", "0");
     			set_style(div52, "height", "25px");
@@ -23796,9 +24812,9 @@
     			attr_dev(div53, "id", "yAxisDrag");
     			set_style(div53, "pointer-events", "all");
     			set_style(div53, "position", "absolute");
-    			set_style(div53, "top", "" + 55 + "px");
-    			set_style(div53, "left", "" + 0 + "px");
-    			set_style(div53, "width", "" + 20 + "px");
+    			set_style(div53, "top", 55 + "px");
+    			set_style(div53, "left", 0 + "px");
+    			set_style(div53, "width", 20 + "px");
     			set_style(div53, "background-color", "#222");
     			set_style(div53, "opacity", "0");
     			set_style(div53, "height", "425px");
@@ -23865,18 +24881,22 @@
     			set_style(div60, "pointer-events", "all");
     			set_style(div60, "position", "absolute");
     			set_style(div60, "top", "-38px");
-    			set_style(div60, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
-    			set_style(div60, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
+    			set_style(div60, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
+
+    			set_style(div60, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
+    			? "visible"
+    			: "hidden");
+
     			set_style(div60, "width", "2px");
     			set_style(div60, "background-color", "#FFF");
     			set_style(div60, "border-right", "1px dashed black");
     			set_style(div60, "pointer-events", "all");
     			set_style(div60, "cursor", "col-resize");
-    			set_style(div60, "height", "" + (height$1+19) + "px");
+    			set_style(div60, "height", /*height*/ ctx[40] + 19 + "px");
     			add_location(div60, file$3, 775, 8, 26117);
     			set_style(div61, "position", "absolute");
-    			set_style(div61, "width", "" + (width$1+15) + "px");
-    			set_style(div61, "height", "" + height$1 + "px");
+    			set_style(div61, "width", /*width*/ ctx[39] + 15 + "px");
+    			set_style(div61, "height", /*height*/ ctx[40] + "px");
     			set_style(div61, "position", "absolute");
     			set_style(div61, "top", "100px");
     			set_style(div61, "left", "10px");
@@ -23916,17 +24936,21 @@
     			add_location(div67, file$3, 833, 12, 28897);
     			set_style(div68, "position", "absolute");
     			set_style(div68, "top", "-38px");
-    			set_style(div68, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
-    			set_style(div68, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
+    			set_style(div68, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
+
+    			set_style(div68, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
+    			? "visible"
+    			: "hidden");
+
     			set_style(div68, "width", "2px");
     			set_style(div68, "background-color", "#FFF");
     			set_style(div68, "border-right", "1px dashed black");
     			set_style(div68, "cursor", "col-resize");
-    			set_style(div68, "height", "" + height$1 + "px");
+    			set_style(div68, "height", /*height*/ ctx[40] + "px");
     			add_location(div68, file$3, 823, 8, 28496);
     			set_style(div69, "position", "absolute");
-    			set_style(div69, "width", "" + (width$1+15) + "px");
-    			set_style(div69, "height", "" + height$1 + "px");
+    			set_style(div69, "width", /*width*/ ctx[39] + 15 + "px");
+    			set_style(div69, "height", /*height*/ ctx[40] + "px");
     			set_style(div69, "position", "absolute");
     			set_style(div69, "top", "120px");
     			set_style(div69, "left", "10px");
@@ -23934,9 +24958,9 @@
     			add_location(div69, file$3, 822, 6, 28351);
     			set_style(div70, "pointer-events", "none");
     			set_style(div70, "position", "absolute");
-    			set_style(div70, "top", "" + (height$1+84) + "px");
-    			set_style(div70, "left", "" + 0 + "px");
-    			set_style(div70, "width", "" + 780 + "px");
+    			set_style(div70, "top", /*height*/ ctx[40] + 84 + "px");
+    			set_style(div70, "left", 0 + "px");
+    			set_style(div70, "width", 780 + "px");
     			set_style(div70, "opacity", "1.0");
     			set_style(div70, "height", "25px");
     			set_style(div70, "cursor", "col-resize");
@@ -23952,11 +24976,15 @@
     			set_style(div72, "left", "10px");
     			set_style(div72, "top", "10px");
     			add_location(div72, file$3, 912, 6, 33012);
-    			set_style(div73, "opacity", (ctx.xScaleTime(ctx.InterventionTime) >= 192? 1.0 : 0.2));
+
+    			set_style(div73, "opacity", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 192
+    			? 1
+    			: 0.2);
+
     			add_location(div73, file$3, 911, 4, 32935);
     			set_style(div74, "flex", "0 0 890px");
     			set_style(div74, "width", "890px");
-    			set_style(div74, "height", "" + (height$1+128) + "px");
+    			set_style(div74, "height", /*height*/ ctx[40] + 128 + "px");
     			set_style(div74, "position", "relative");
     			add_location(div74, file$3, 730, 2, 24616);
     			attr_dev(div75, "class", "chart svelte-1vzb36m");
@@ -23985,7 +25013,7 @@
     			attr_dev(input1, "class", "range svelte-1vzb36m");
     			set_style(input1, "margin-bottom", "8px");
     			attr_dev(input1, "type", "range");
-    			attr_dev(input1, "min", 5);
+    			attr_dev(input1, "min", input1_min_value = 5);
     			attr_dev(input1, "max", "25");
     			attr_dev(input1, "step", "0.01");
     			add_location(input1, file$3, 934, 6, 33829);
@@ -23999,7 +25027,7 @@
     			add_location(div84, file$3, 936, 6, 34073);
     			attr_dev(input2, "class", "range svelte-1vzb36m");
     			attr_dev(input2, "type", "range");
-    			attr_dev(input2, "min", 1);
+    			attr_dev(input2, "min", input2_min_value = 1);
     			attr_dev(input2, "max", "10000");
     			attr_dev(input2, "step", "1");
     			add_location(input2, file$3, 937, 6, 34114);
@@ -24035,7 +25063,7 @@
     			attr_dev(input4, "class", "range svelte-1vzb36m");
     			set_style(input4, "margin-bottom", "8px");
     			attr_dev(input4, "type", "range");
-    			attr_dev(input4, "min", 0.15);
+    			attr_dev(input4, "min", input4_min_value = 0.15);
     			attr_dev(input4, "max", "24");
     			attr_dev(input4, "step", "0.0001");
     			add_location(input4, file$3, 953, 6, 34923);
@@ -24050,7 +25078,7 @@
     			add_location(div95, file$3, 955, 6, 35221);
     			attr_dev(input5, "class", "range svelte-1vzb36m");
     			attr_dev(input5, "type", "range");
-    			attr_dev(input5, "min", 0);
+    			attr_dev(input5, "min", input5_min_value = 0);
     			attr_dev(input5, "max", "24");
     			attr_dev(input5, "step", "0.01");
     			add_location(input5, file$3, 956, 6, 35277);
@@ -24070,7 +25098,7 @@
     			attr_dev(input6, "class", "range svelte-1vzb36m");
     			set_style(input6, "margin-bottom", "8px");
     			attr_dev(input6, "type", "range");
-    			attr_dev(input6, "min", 0);
+    			attr_dev(input6, "min", input6_min_value = 0);
     			attr_dev(input6, "max", "1");
     			attr_dev(input6, "step", "0.0001");
     			add_location(input6, file$3, 965, 6, 35651);
@@ -24084,7 +25112,7 @@
     			add_location(div102, file$3, 967, 6, 35904);
     			attr_dev(input7, "class", "range svelte-1vzb36m");
     			attr_dev(input7, "type", "range");
-    			attr_dev(input7, "min", input7_min_value = (ctx.D_infectious)+0.1);
+    			attr_dev(input7, "min", input7_min_value = /*D_infectious*/ ctx[7] + 0.1);
     			attr_dev(input7, "max", "100");
     			attr_dev(input7, "step", "0.01");
     			add_location(input7, file$3, 968, 6, 35961);
@@ -24101,7 +25129,7 @@
     			attr_dev(input8, "class", "range svelte-1vzb36m");
     			set_style(input8, "margin-bottom", "8px");
     			attr_dev(input8, "type", "range");
-    			attr_dev(input8, "min", 0.1);
+    			attr_dev(input8, "min", input8_min_value = 0.1);
     			attr_dev(input8, "max", "100");
     			attr_dev(input8, "step", "0.01");
     			add_location(input8, file$3, 975, 6, 36302);
@@ -24115,7 +25143,7 @@
     			add_location(div108, file$3, 977, 6, 36562);
     			attr_dev(input9, "class", "range svelte-1vzb36m");
     			attr_dev(input9, "type", "range");
-    			attr_dev(input9, "min", 0.5);
+    			attr_dev(input9, "min", input9_min_value = 0.5);
     			attr_dev(input9, "max", "100");
     			attr_dev(input9, "step", "0.01");
     			add_location(input9, file$3, 978, 6, 36621);
@@ -24132,7 +25160,7 @@
     			attr_dev(input10, "class", "range svelte-1vzb36m");
     			set_style(input10, "margin-bottom", "8px");
     			attr_dev(input10, "type", "range");
-    			attr_dev(input10, "min", 0);
+    			attr_dev(input10, "min", input10_min_value = 0);
     			attr_dev(input10, "max", "1");
     			attr_dev(input10, "step", "0.0001");
     			add_location(input10, file$3, 985, 6, 36953);
@@ -24146,7 +25174,7 @@
     			add_location(div114, file$3, 987, 6, 37203);
     			attr_dev(input11, "class", "range svelte-1vzb36m");
     			attr_dev(input11, "type", "range");
-    			attr_dev(input11, "min", 0.5);
+    			attr_dev(input11, "min", input11_min_value = 0.5);
     			attr_dev(input11, "max", "100");
     			attr_dev(input11, "step", "0.01");
     			add_location(input11, file$3, 988, 6, 37261);
@@ -24167,10 +25195,10 @@
     			add_location(b1, file$3, 1001, 71, 37915);
     			add_location(b2, file$3, 1001, 180, 38024);
     			add_location(b3, file$3, 1001, 233, 38077);
-    			set_style(span16, "color", ctx.colors[4]);
+    			set_style(span16, "color", /*colors*/ ctx[36][4]);
     			add_location(span16, file$3, 1001, 201, 38045);
     			add_location(b4, file$3, 1001, 289, 38133);
-    			set_style(span17, "color", ctx.colors[3]);
+    			set_style(span17, "color", /*colors*/ ctx[36][3]);
     			add_location(span17, file$3, 1001, 257, 38101);
     			add_location(b5, file$3, 1001, 320, 38164);
     			add_location(span18, file$3, 1001, 314, 38158);
@@ -24188,7 +25216,7 @@
     			attr_dev(a3, "class", "svelte-1vzb36m");
     			add_location(a3, file$3, 1007, 203, 39083);
     			attr_dev(input12, "type", "text");
-    			set_style(input12, "width", "" + (ctx.Math.ceil(ctx.Math.log10(ctx.p_num_ind))*9.5 + 5) + "px");
+    			set_style(input12, "width", Math.ceil(Math.log10(/*p_num_ind*/ ctx[32])) * 9.5 + 5 + "px");
     			set_style(input12, "font-size", "15.5px");
     			set_style(input12, "color", "#777");
     			add_location(input12, file$3, 1007, 315, 39195);
@@ -24406,44 +25434,37 @@
     			attr_dev(a19, "href", "mailto:izmegabe@gmail.com");
     			attr_dev(a19, "class", "svelte-1vzb36m");
     			add_location(a19, file$3, 1113, 85, 43229);
+    			attr_dev(a20, "href", "http://gabgoh.github.io/");
+    			attr_dev(a20, "class", "svelte-1vzb36m");
+    			add_location(a20, file$3, 1113, 134, 43278);
     			attr_dev(p5, "class", "center svelte-1vzb36m");
     			add_location(p5, file$3, 1112, 0, 43125);
-    			script.async = true;
-    			attr_dev(script, "src", "https://platform.twitter.com/widgets.js");
-    			attr_dev(script, "charset", "utf-8");
-    			add_location(script, file$3, 1117, 116, 43416);
-    			attr_dev(a20, "href", "https://twitter.com/gabeeegoooh?ref_src=twsrc%5Etfw");
-    			attr_dev(a20, "class", "twitter-follow-button svelte-1vzb36m");
-    			attr_dev(a20, "data-show-count", "false");
-    			add_location(a20, file$3, 1117, 0, 43300);
+    			add_location(b6, file$3, 1122, 0, 43590);
+    			add_location(br16, file$3, 1122, 22, 43612);
+    			html_tag_6 = new HtmlTag(raw8_value, t399);
+    			add_location(i14, file$3, 1123, 172, 43789);
+    			add_location(i15, file$3, 1123, 245, 43862);
+    			add_location(i16, file$3, 1123, 316, 43933);
     			attr_dev(p6, "class", "center svelte-1vzb36m");
-    			add_location(p6, file$3, 1116, 0, 43281);
-    			add_location(b6, file$3, 1122, 0, 43530);
-    			add_location(br16, file$3, 1122, 22, 43552);
-    			html_tag_6 = new HtmlTag(raw8_value, t398);
-    			add_location(i14, file$3, 1123, 172, 43729);
-    			add_location(i15, file$3, 1123, 245, 43802);
-    			add_location(i16, file$3, 1123, 316, 43873);
-    			attr_dev(p7, "class", "center svelte-1vzb36m");
-    			add_location(p7, file$3, 1121, 0, 43509);
-    			add_location(b7, file$3, 1127, 0, 44334);
-    			add_location(br17, file$3, 1127, 25, 44359);
+    			add_location(p6, file$3, 1121, 0, 43569);
+    			add_location(b7, file$3, 1127, 0, 44394);
+    			add_location(br17, file$3, 1127, 25, 44419);
     			attr_dev(a21, "href", "https://enkimute.github.io/");
     			attr_dev(a21, "class", "svelte-1vzb36m");
-    			add_location(a21, file$3, 1128, 0, 44364);
+    			add_location(a21, file$3, 1128, 0, 44424);
     			attr_dev(a22, "href", "https://twitter.com/ch402");
     			attr_dev(a22, "class", "svelte-1vzb36m");
-    			add_location(a22, file$3, 1128, 82, 44446);
+    			add_location(a22, file$3, 1128, 82, 44506);
     			attr_dev(a23, "href", "https://twitter.com/shancarter");
     			attr_dev(a23, "class", "svelte-1vzb36m");
-    			add_location(a23, file$3, 1128, 134, 44498);
+    			add_location(a23, file$3, 1128, 134, 44558);
     			attr_dev(a24, "href", "https://twitter.com/ludwigschubert");
     			attr_dev(a24, "class", "svelte-1vzb36m");
-    			add_location(a24, file$3, 1129, 9, 44560);
-    			attr_dev(p8, "class", "center svelte-1vzb36m");
-    			add_location(p8, file$3, 1126, 0, 44313);
+    			add_location(a24, file$3, 1129, 9, 44620);
+    			attr_dev(p7, "class", "center svelte-1vzb36m");
+    			add_location(p7, file$3, 1126, 0, 44373);
     			attr_dev(div120, "class", "legendtext svelte-1vzb36m");
-    			add_location(div120, file$3, 1137, 4, 44829);
+    			add_location(div120, file$3, 1137, 4, 44889);
     			attr_dev(textarea, "type", "textarea");
     			attr_dev(textarea, "rows", "1");
     			attr_dev(textarea, "cols", "5000");
@@ -24453,53 +25474,21 @@
     			set_style(textarea, "text-align", "left");
     			attr_dev(textarea, "id", "fname");
     			attr_dev(textarea, "name", "fname");
-    			textarea.value = ctx.state;
-    			add_location(textarea, file$3, 1139, 6, 44895);
-    			add_location(form, file$3, 1138, 4, 44882);
+    			textarea.value = /*state*/ ctx[16];
+    			add_location(textarea, file$3, 1139, 6, 44955);
+    			add_location(form, file$3, 1138, 4, 44942);
     			attr_dev(div121, "class", "center svelte-1vzb36m");
     			set_style(div121, "padding", "10px");
     			set_style(div121, "margin-top", "3px");
     			set_style(div121, "width", "925px");
-    			add_location(div121, file$3, 1136, 2, 44751);
+    			add_location(div121, file$3, 1136, 2, 44811);
     			set_style(div122, "margin-bottom", "30px");
-    			add_location(div122, file$3, 1134, 0, 44714);
-
-    			dispose = [
-    				listen_dev(div64, "mousedown", ctx.lock_yaxis),
-    				listen_dev(input0, "change", ctx.input0_change_input_handler),
-    				listen_dev(input0, "input", ctx.input0_change_input_handler),
-    				listen_dev(input0, "mousedown", ctx.lock_yaxis),
-    				listen_dev(input1, "change", ctx.input1_change_input_handler),
-    				listen_dev(input1, "input", ctx.input1_change_input_handler),
-    				listen_dev(input2, "change", ctx.input2_change_input_handler),
-    				listen_dev(input2, "input", ctx.input2_change_input_handler),
-    				listen_dev(input3, "change", ctx.input3_change_input_handler),
-    				listen_dev(input3, "input", ctx.input3_change_input_handler),
-    				listen_dev(input4, "change", ctx.input4_change_input_handler),
-    				listen_dev(input4, "input", ctx.input4_change_input_handler),
-    				listen_dev(input5, "change", ctx.input5_change_input_handler),
-    				listen_dev(input5, "input", ctx.input5_change_input_handler),
-    				listen_dev(input6, "change", ctx.input6_change_input_handler),
-    				listen_dev(input6, "input", ctx.input6_change_input_handler),
-    				listen_dev(input7, "change", ctx.input7_change_input_handler),
-    				listen_dev(input7, "input", ctx.input7_change_input_handler),
-    				listen_dev(input8, "change", ctx.input8_change_input_handler),
-    				listen_dev(input8, "input", ctx.input8_change_input_handler),
-    				listen_dev(input9, "change", ctx.input9_change_input_handler),
-    				listen_dev(input9, "input", ctx.input9_change_input_handler),
-    				listen_dev(input10, "change", ctx.input10_change_input_handler),
-    				listen_dev(input10, "input", ctx.input10_change_input_handler),
-    				listen_dev(input11, "change", ctx.input11_change_input_handler),
-    				listen_dev(input11, "input", ctx.input11_change_input_handler),
-    				listen_dev(input12, "input", ctx.input12_input_handler)
-    			];
+    			add_location(div122, file$3, 1134, 0, 44774);
     		},
-
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
-
-    		m: function mount(target, anchor) {
+    		m: function mount(target, anchor, remount) {
     			insert_dev(target, link, anchor);
     			insert_dev(target, t0, anchor);
     			insert_dev(target, h2, anchor);
@@ -24746,9 +25735,7 @@
     			append_dev(div64, t145);
     			append_dev(div65, t146);
     			append_dev(div65, input0);
-
-    			set_input_value(input0, ctx.InterventionAmt);
-
+    			set_input_value(input0, /*InterventionAmt*/ ctx[13]);
     			append_dev(div74, t147);
     			append_dev(div74, div70);
 
@@ -24782,9 +25769,7 @@
     			append_dev(div82, t160);
     			append_dev(div85, t161);
     			append_dev(div85, input1);
-
-    			set_input_value(input1, ctx.logN);
-
+    			set_input_value(input1, /*logN*/ ctx[2]);
     			append_dev(div85, t162);
     			append_dev(div85, div83);
     			append_dev(div83, t163);
@@ -24794,9 +25779,7 @@
     			append_dev(div84, t165);
     			append_dev(div85, t166);
     			append_dev(div85, input2);
-
-    			set_input_value(input2, ctx.I0);
-
+    			set_input_value(input2, /*I0*/ ctx[4]);
     			append_dev(div116, t167);
     			append_dev(div116, div90);
     			append_dev(div90, div88);
@@ -24812,9 +25795,7 @@
     			append_dev(div89, t172);
     			append_dev(div90, t173);
     			append_dev(div90, input3);
-
-    			set_input_value(input3, ctx.R0);
-
+    			set_input_value(input3, /*R0*/ ctx[5]);
     			append_dev(div116, t174);
     			append_dev(div116, div96);
     			append_dev(div96, div91);
@@ -24830,9 +25811,7 @@
     			append_dev(div93, t181);
     			append_dev(div96, t182);
     			append_dev(div96, input4);
-
-    			set_input_value(input4, ctx.D_incbation);
-
+    			set_input_value(input4, /*D_incbation*/ ctx[6]);
     			append_dev(div96, t183);
     			append_dev(div96, div94);
     			append_dev(div94, t184);
@@ -24845,9 +25824,7 @@
     			append_dev(div95, t188);
     			append_dev(div96, t189);
     			append_dev(div96, input5);
-
-    			set_input_value(input5, ctx.D_infectious);
-
+    			set_input_value(input5, /*D_infectious*/ ctx[7]);
     			append_dev(div116, t190);
     			append_dev(div116, div97);
     			append_dev(div116, t191);
@@ -24863,9 +25840,7 @@
     			append_dev(div100, t197);
     			append_dev(div103, t198);
     			append_dev(div103, input6);
-
-    			set_input_value(input6, ctx.CFR);
-
+    			set_input_value(input6, /*CFR*/ ctx[11]);
     			append_dev(div103, t199);
     			append_dev(div103, div101);
     			append_dev(div101, t200);
@@ -24876,9 +25851,7 @@
     			append_dev(div102, t203);
     			append_dev(div103, t204);
     			append_dev(div103, input7);
-
-    			set_input_value(input7, ctx.Time_to_death);
-
+    			set_input_value(input7, /*Time_to_death*/ ctx[1]);
     			append_dev(div116, t205);
     			append_dev(div116, div109);
     			append_dev(div109, div104);
@@ -24892,9 +25865,7 @@
     			append_dev(div106, t211);
     			append_dev(div109, t212);
     			append_dev(div109, input8);
-
-    			set_input_value(input8, ctx.D_recovery_severe);
-
+    			set_input_value(input8, /*D_recovery_severe*/ ctx[9]);
     			append_dev(div109, t213);
     			append_dev(div109, div107);
     			append_dev(div107, t214);
@@ -24905,9 +25876,7 @@
     			append_dev(div108, t217);
     			append_dev(div109, t218);
     			append_dev(div109, input9);
-
-    			set_input_value(input9, ctx.D_recovery_mild);
-
+    			set_input_value(input9, /*D_recovery_mild*/ ctx[8]);
     			append_dev(div116, t219);
     			append_dev(div116, div115);
     			append_dev(div115, div110);
@@ -24921,9 +25890,7 @@
     			append_dev(div112, t225);
     			append_dev(div115, t226);
     			append_dev(div115, input10);
-
-    			set_input_value(input10, ctx.P_SEVERE);
-
+    			set_input_value(input10, /*P_SEVERE*/ ctx[15]);
     			append_dev(div115, t227);
     			append_dev(div115, div113);
     			append_dev(div113, t228);
@@ -24934,9 +25901,7 @@
     			append_dev(div114, t231);
     			append_dev(div115, t232);
     			append_dev(div115, input11);
-
-    			set_input_value(input11, ctx.D_hospital_lag);
-
+    			set_input_value(input11, /*D_hospital_lag*/ ctx[10]);
     			insert_dev(target, t233, anchor);
     			insert_dev(target, div118, anchor);
     			insert_dev(target, t234, anchor);
@@ -24964,7 +25929,7 @@
     			append_dev(p1, a2);
     			append_dev(p1, t252);
     			append_dev(p1, span19);
-    			span19.innerHTML = ctx.ode_eqn;
+    			span19.innerHTML = /*ode_eqn*/ ctx[31];
     			append_dev(p1, t253);
     			insert_dev(target, t254, anchor);
     			insert_dev(target, p2, anchor);
@@ -24974,9 +25939,7 @@
     			append_dev(p2, a3);
     			append_dev(p2, t259);
     			append_dev(p2, input12);
-
-    			set_input_value(input12, ctx.p_num_ind);
-
+    			set_input_value(input12, /*p_num_ind*/ ctx[32]);
     			append_dev(p2, t260);
     			append_dev(p2, t261);
     			append_dev(p2, t262);
@@ -25159,194 +26122,175 @@
     			append_dev(p5, t391);
     			append_dev(p5, a19);
     			append_dev(p5, t393);
-    			insert_dev(target, t394, anchor);
+    			append_dev(p5, a20);
+    			append_dev(p5, t395);
+    			insert_dev(target, t396, anchor);
     			insert_dev(target, p6, anchor);
-    			append_dev(p6, a20);
-    			append_dev(a20, script);
-    			insert_dev(target, t395, anchor);
+    			append_dev(p6, b6);
+    			append_dev(p6, br16);
+    			append_dev(p6, t398);
+    			html_tag_6.m(p6);
+    			append_dev(p6, t399);
+    			append_dev(p6, i14);
+    			append_dev(p6, t401);
+    			append_dev(p6, i15);
+    			append_dev(p6, t403);
+    			append_dev(p6, i16);
+    			append_dev(p6, t405);
+    			insert_dev(target, t406, anchor);
     			insert_dev(target, p7, anchor);
-    			append_dev(p7, b6);
-    			append_dev(p7, br16);
-    			append_dev(p7, t397);
-    			html_tag_6.m(p7);
-    			append_dev(p7, t398);
-    			append_dev(p7, i14);
-    			append_dev(p7, t400);
-    			append_dev(p7, i15);
-    			append_dev(p7, t402);
-    			append_dev(p7, i16);
-    			append_dev(p7, t404);
-    			insert_dev(target, t405, anchor);
-    			insert_dev(target, p8, anchor);
-    			append_dev(p8, b7);
-    			append_dev(p8, br17);
-    			append_dev(p8, t407);
-    			append_dev(p8, a21);
-    			append_dev(p8, t409);
-    			append_dev(p8, a22);
-    			append_dev(p8, t411);
-    			append_dev(p8, a23);
-    			append_dev(p8, t413);
-    			append_dev(p8, a24);
-    			append_dev(p8, t415);
-    			insert_dev(target, t416, anchor);
+    			append_dev(p7, b7);
+    			append_dev(p7, br17);
+    			append_dev(p7, t408);
+    			append_dev(p7, a21);
+    			append_dev(p7, t410);
+    			append_dev(p7, a22);
+    			append_dev(p7, t412);
+    			append_dev(p7, a23);
+    			append_dev(p7, t414);
+    			append_dev(p7, a24);
+    			append_dev(p7, t416);
+    			insert_dev(target, t417, anchor);
     			insert_dev(target, div122, anchor);
     			append_dev(div122, div121);
     			append_dev(div121, div120);
-    			append_dev(div121, t418);
+    			append_dev(div121, t419);
     			append_dev(div121, form);
     			append_dev(form, textarea);
     			current = true;
+    			if (remount) run_all(dispose);
+
+    			dispose = [
+    				listen_dev(div64, "mousedown", /*lock_yaxis*/ ctx[37], false, false, false),
+    				listen_dev(input0, "change", /*input0_change_input_handler*/ ctx[71]),
+    				listen_dev(input0, "input", /*input0_change_input_handler*/ ctx[71]),
+    				listen_dev(input0, "mousedown", /*lock_yaxis*/ ctx[37], false, false, false),
+    				listen_dev(input1, "change", /*input1_change_input_handler*/ ctx[73]),
+    				listen_dev(input1, "input", /*input1_change_input_handler*/ ctx[73]),
+    				listen_dev(input2, "change", /*input2_change_input_handler*/ ctx[74]),
+    				listen_dev(input2, "input", /*input2_change_input_handler*/ ctx[74]),
+    				listen_dev(input3, "change", /*input3_change_input_handler*/ ctx[75]),
+    				listen_dev(input3, "input", /*input3_change_input_handler*/ ctx[75]),
+    				listen_dev(input4, "change", /*input4_change_input_handler*/ ctx[76]),
+    				listen_dev(input4, "input", /*input4_change_input_handler*/ ctx[76]),
+    				listen_dev(input5, "change", /*input5_change_input_handler*/ ctx[77]),
+    				listen_dev(input5, "input", /*input5_change_input_handler*/ ctx[77]),
+    				listen_dev(input6, "change", /*input6_change_input_handler*/ ctx[78]),
+    				listen_dev(input6, "input", /*input6_change_input_handler*/ ctx[78]),
+    				listen_dev(input7, "change", /*input7_change_input_handler*/ ctx[79]),
+    				listen_dev(input7, "input", /*input7_change_input_handler*/ ctx[79]),
+    				listen_dev(input8, "change", /*input8_change_input_handler*/ ctx[80]),
+    				listen_dev(input8, "input", /*input8_change_input_handler*/ ctx[80]),
+    				listen_dev(input9, "change", /*input9_change_input_handler*/ ctx[81]),
+    				listen_dev(input9, "input", /*input9_change_input_handler*/ ctx[81]),
+    				listen_dev(input10, "change", /*input10_change_input_handler*/ ctx[82]),
+    				listen_dev(input10, "input", /*input10_change_input_handler*/ ctx[82]),
+    				listen_dev(input11, "change", /*input11_change_input_handler*/ ctx[83]),
+    				listen_dev(input11, "input", /*input11_change_input_handler*/ ctx[83]),
+    				listen_dev(input12, "input", /*input12_input_handler*/ ctx[84])
+    			];
     		},
+    		p: function update(ctx, dirty) {
+    			if ((!current || dirty[0] & /*indexToTime, active_*/ 1342177280) && t5_value !== (t5_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "")) set_data_dev(t5, t5_value);
+    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t13_value !== (t13_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0])) + "")) set_data_dev(t13, t13_value);
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t15_value !== (t15_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0]).toFixed(2) + "")) set_data_dev(t15, t15_value);
+    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t20_value !== (t20_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[0])) + "")) set_data_dev(t20, t20_value);
+    			const checkbox1_changes = {};
 
-    		p: function update(changed, ctx) {
-    			if ((!current || changed.indexToTime || changed.active_) && t5_value !== (t5_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "")) {
-    				set_data_dev(t5, t5_value);
+    			if (!updating_checked && dirty[0] & /*checked*/ 33554432) {
+    				updating_checked = true;
+    				checkbox1_changes.checked = /*checked*/ ctx[25][4];
+    				add_flush_callback(() => updating_checked = false);
     			}
 
-    			if ((!current || changed.N || changed.Iters || changed.active_) && t13_value !== (t13_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][0])) + "")) {
-    				set_data_dev(t13, t13_value);
-    			}
-
-    			if ((!current || changed.Iters || changed.active_) && t15_value !== (t15_value = (100*ctx.Iters[ctx.active_][0]).toFixed(2) + "")) {
-    				set_data_dev(t15, t15_value);
-    			}
-
-    			if ((!current || changed.N || changed.get_d || changed.active_) && t20_value !== (t20_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[0])) + "")) {
-    				set_data_dev(t20, t20_value);
-    			}
-
-    			var checkbox1_changes = {};
-    			if (!updating_checked && changed.checked) {
-    				checkbox1_changes.checked = ctx.checked[4];
-    			}
     			checkbox1.$set(checkbox1_changes);
+    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t31_value !== (t31_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1])) + "")) set_data_dev(t31, t31_value);
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t33_value !== (t33_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1]).toFixed(2) + "")) set_data_dev(t33, t33_value);
+    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t38_value !== (t38_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[1])) + "")) set_data_dev(t38, t38_value);
+    			const checkbox2_changes = {};
 
-    			if ((!current || changed.N || changed.Iters || changed.active_) && t31_value !== (t31_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][1])) + "")) {
-    				set_data_dev(t31, t31_value);
+    			if (!updating_checked_1 && dirty[0] & /*checked*/ 33554432) {
+    				updating_checked_1 = true;
+    				checkbox2_changes.checked = /*checked*/ ctx[25][3];
+    				add_flush_callback(() => updating_checked_1 = false);
     			}
 
-    			if ((!current || changed.Iters || changed.active_) && t33_value !== (t33_value = (100*ctx.Iters[ctx.active_][1]).toFixed(2) + "")) {
-    				set_data_dev(t33, t33_value);
-    			}
-
-    			if ((!current || changed.N || changed.get_d || changed.active_) && t38_value !== (t38_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[1])) + "")) {
-    				set_data_dev(t38, t38_value);
-    			}
-
-    			var checkbox2_changes = {};
-    			if (!updating_checked_1 && changed.checked) {
-    				checkbox2_changes.checked = ctx.checked[3];
-    			}
     			checkbox2.$set(checkbox2_changes);
-
-    			if ((!current || changed.N || changed.Iters || changed.active_) && t49_value !== (t49_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][2])) + "")) {
-    				set_data_dev(t49, t49_value);
-    			}
-
-    			if ((!current || changed.Iters || changed.active_) && t51_value !== (t51_value = (100*ctx.Iters[ctx.active_][2]).toFixed(2) + "")) {
-    				set_data_dev(t51, t51_value);
-    			}
-
-    			if ((!current || changed.N || changed.get_d || changed.active_) && t56_value !== (t56_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[2])) + "")) {
-    				set_data_dev(t56, t56_value);
-    			}
-
-    			var checkbox3_changes = {};
-    			if (changed.checked) checkbox3_changes.callback = ctx.func;
+    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t49_value !== (t49_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2])) + "")) set_data_dev(t49, t49_value);
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t51_value !== (t51_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]).toFixed(2) + "")) set_data_dev(t51, t51_value);
+    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t56_value !== (t56_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[2])) + "")) set_data_dev(t56, t56_value);
+    			const checkbox3_changes = {};
+    			if (dirty[0] & /*checked*/ 33554432) checkbox3_changes.callback = /*func*/ ctx[65];
     			checkbox3.$set(checkbox3_changes);
+    			if ((!current || dirty[0] & /*N, Iters, active_, I0*/ 1082130456) && t69_value !== (t69_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]) + /*I0*/ ctx[4])) + "")) set_data_dev(t69, t69_value);
+    			if ((!current || dirty[0] & /*Iters, active_, I0, N*/ 1082130456) && t71_value !== (t71_value = (100 * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] - /*I0*/ ctx[4] / /*N*/ ctx[3])).toFixed(2) + "")) set_data_dev(t71, t71_value);
+    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t76_value !== (t76_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[3] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[4] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[7]))) + "")) set_data_dev(t76, t76_value);
+    			const checkbox4_changes = {};
 
-    			if ((!current || changed.N || changed.Iters || changed.active_ || changed.I0) && t69_value !== (t69_value = formatNumber$1(ctx.Math.round(ctx.N* (1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2])+ctx.I0 )) + "")) {
-    				set_data_dev(t69, t69_value);
+    			if (!updating_checked_2 && dirty[0] & /*checked*/ 33554432) {
+    				updating_checked_2 = true;
+    				checkbox4_changes.checked = /*checked*/ ctx[25][2];
+    				add_flush_callback(() => updating_checked_2 = false);
     			}
 
-    			if ((!current || changed.Iters || changed.active_ || changed.I0 || changed.N) && t71_value !== (t71_value = ((100*(1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2]-ctx.I0/ctx.N))).toFixed(2) + "")) {
-    				set_data_dev(t71, t71_value);
-    			}
-
-    			if ((!current || changed.N || changed.get_d || changed.active_) && t76_value !== (t76_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[3]+ctx.get_d(ctx.active_)[4]+ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]+ctx.get_d(ctx.active_)[7]) )) + "")) {
-    				set_data_dev(t76, t76_value);
-    			}
-
-    			var checkbox4_changes = {};
-    			if (!updating_checked_2 && changed.checked) {
-    				checkbox4_changes.checked = ctx.checked[2];
-    			}
     			checkbox4.$set(checkbox4_changes);
+    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t87_value !== (t87_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8]))) + "")) set_data_dev(t87, t87_value);
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t89_value !== (t89_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8])).toFixed(2) + "")) set_data_dev(t89, t89_value);
+    			const checkbox5_changes = {};
 
-    			if ((!current || changed.N || changed.Iters || changed.active_) && t87_value !== (t87_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8]) )) + "")) {
-    				set_data_dev(t87, t87_value);
+    			if (!updating_checked_3 && dirty[0] & /*checked*/ 33554432) {
+    				updating_checked_3 = true;
+    				checkbox5_changes.checked = /*checked*/ ctx[25][1];
+    				add_flush_callback(() => updating_checked_3 = false);
     			}
 
-    			if ((!current || changed.Iters || changed.active_) && t89_value !== (t89_value = (100*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8])).toFixed(2) + "")) {
-    				set_data_dev(t89, t89_value);
-    			}
-
-    			var checkbox5_changes = {};
-    			if (!updating_checked_3 && changed.checked) {
-    				checkbox5_changes.checked = ctx.checked[1];
-    			}
     			checkbox5.$set(checkbox5_changes);
+    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t100_value !== (t100_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6]))) + "")) set_data_dev(t100, t100_value);
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t102_value !== (t102_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6])).toFixed(2) + "")) set_data_dev(t102, t102_value);
+    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t107_value !== (t107_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6]))) + "")) set_data_dev(t107, t107_value);
+    			const checkbox6_changes = {};
 
-    			if ((!current || changed.N || changed.Iters || changed.active_) && t100_value !== (t100_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6]) )) + "")) {
-    				set_data_dev(t100, t100_value);
+    			if (!updating_checked_4 && dirty[0] & /*checked*/ 33554432) {
+    				updating_checked_4 = true;
+    				checkbox6_changes.checked = /*checked*/ ctx[25][0];
+    				add_flush_callback(() => updating_checked_4 = false);
     			}
 
-    			if ((!current || changed.Iters || changed.active_) && t102_value !== (t102_value = (100*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6])).toFixed(2) + "")) {
-    				set_data_dev(t102, t102_value);
-    			}
-
-    			if ((!current || changed.N || changed.get_d || changed.active_) && t107_value !== (t107_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]))) + "")) {
-    				set_data_dev(t107, t107_value);
-    			}
-
-    			var checkbox6_changes = {};
-    			if (!updating_checked_4 && changed.checked) {
-    				checkbox6_changes.checked = ctx.checked[0];
-    			}
     			checkbox6.$set(checkbox6_changes);
+    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t118_value !== (t118_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9])) + "")) set_data_dev(t118, t118_value);
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t120_value !== (t120_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9]).toFixed(2) + "")) set_data_dev(t120, t120_value);
+    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t125_value !== (t125_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[9])) + "")) set_data_dev(t125, t125_value);
+    			const chart_changes = {};
+    			if (dirty[0] & /*P*/ 131072) chart_changes.y = /*P*/ ctx[17];
+    			if (dirty[0] & /*Xmax*/ 16384) chart_changes.xmax = /*Xmax*/ ctx[14];
+    			if (dirty[0] & /*total_infected*/ 4194304) chart_changes.total_infected = /*total_infected*/ ctx[22];
+    			if (dirty[0] & /*deaths*/ 1048576) chart_changes.deaths = /*deaths*/ ctx[20];
+    			if (dirty[0] & /*total*/ 2097152) chart_changes.total = /*total*/ ctx[21];
+    			if (dirty[0] & /*timestep*/ 262144) chart_changes.timestep = /*timestep*/ ctx[18];
+    			if (dirty[0] & /*tmax*/ 524288) chart_changes.tmax = /*tmax*/ ctx[19];
+    			if (dirty[0] & /*N*/ 8) chart_changes.N = /*N*/ ctx[3];
+    			if (dirty[0] & /*lock, Plock, Pmax*/ 83886081) chart_changes.ymax = /*lock*/ ctx[26] ? /*Plock*/ ctx[0] : /*Pmax*/ ctx[24];
+    			if (dirty[0] & /*InterventionTime*/ 4096) chart_changes.InterventionTime = /*InterventionTime*/ ctx[12];
+    			if (dirty[1] & /*log*/ 16) chart_changes.log = !/*log*/ ctx[35];
 
-    			if ((!current || changed.N || changed.Iters || changed.active_) && t118_value !== (t118_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][9])) + "")) {
-    				set_data_dev(t118, t118_value);
+    			if (!updating_checked_5 && dirty[0] & /*checked*/ 33554432) {
+    				updating_checked_5 = true;
+    				chart_changes.checked = /*checked*/ ctx[25];
+    				add_flush_callback(() => updating_checked_5 = false);
     			}
 
-    			if ((!current || changed.Iters || changed.active_) && t120_value !== (t120_value = (100*ctx.Iters[ctx.active_][9]).toFixed(2) + "")) {
-    				set_data_dev(t120, t120_value);
+    			if (!updating_active && dirty[0] & /*active*/ 536870912) {
+    				updating_active = true;
+    				chart_changes.active = /*active*/ ctx[29];
+    				add_flush_callback(() => updating_active = false);
     			}
 
-    			if ((!current || changed.N || changed.get_d || changed.active_) && t125_value !== (t125_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[9])) + "")) {
-    				set_data_dev(t125, t125_value);
-    			}
-
-    			var chart_changes = {};
-    			if (changed.P) chart_changes.y = ctx.P;
-    			if (changed.Xmax) chart_changes.xmax = ctx.Xmax;
-    			if (changed.total_infected) chart_changes.total_infected = ctx.total_infected;
-    			if (changed.deaths) chart_changes.deaths = ctx.deaths;
-    			if (changed.total) chart_changes.total = ctx.total;
-    			if (changed.timestep) chart_changes.timestep = ctx.timestep;
-    			if (changed.tmax) chart_changes.tmax = ctx.tmax;
-    			if (changed.N) chart_changes.N = ctx.N;
-    			if (changed.lock || changed.Plock || changed.Pmax) chart_changes.ymax = ctx.lock ? ctx.Plock: ctx.Pmax;
-    			if (changed.InterventionTime) chart_changes.InterventionTime = ctx.InterventionTime;
-    			if (changed.log) chart_changes.log = !ctx.log;
-    			if (!updating_checked_5 && changed.checked) {
-    				chart_changes.checked = ctx.checked;
-    			}
-    			if (!updating_active && changed.active) {
-    				chart_changes.active = ctx.active;
-    			}
     			chart.$set(chart_changes);
-
-    			if ((!current || changed.R0 || changed.InterventionAmt) && raw0_value !== (raw0_value = math_inline("\\mathcal{R}_t=" + (ctx.R0*ctx.InterventionAmt).toFixed(2) ) + "")) {
-    				span14.innerHTML = raw0_value;
-    			}
-
-    			if (changed.xScaleTime || changed.InterventionTime) show_if = ctx.xScaleTime(ctx.InterventionTime) >= 100;
+    			if ((!current || dirty[0] & /*R0, InterventionAmt*/ 8224) && raw0_value !== (raw0_value = math_inline("\\mathcal{R}_t=" + (/*R0*/ ctx[5] * /*InterventionAmt*/ ctx[13]).toFixed(2)) + "")) span14.innerHTML = raw0_value;			if (dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) show_if = /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 100;
 
     			if (show_if) {
     				if (if_block) {
-    					if_block.p(changed, ctx);
+    					if_block.p(ctx, dirty);
     				} else {
     					if_block = create_if_block$1(ctx);
     					if_block.c();
@@ -25357,35 +26301,44 @@
     				if_block = null;
     			}
 
-    			if ((!current || changed.InterventionTime) && t137_value !== (t137_value = format("d")(ctx.InterventionTime) + "")) {
-    				set_data_dev(t137, t137_value);
+    			if ((!current || dirty[0] & /*InterventionTime*/ 4096) && t137_value !== (t137_value = format("d")(/*InterventionTime*/ ctx[12]) + "")) set_data_dev(t137, t137_value);
+
+    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
+    				set_style(div60, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
     			}
 
-    			if (!current || changed.xScaleTime || changed.InterventionTime) {
-    				set_style(div60, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
-    				set_style(div60, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
+    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
+    				set_style(div60, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
+    				? "visible"
+    				: "hidden");
     			}
 
-    			if ((!current || changed.InterventionAmt) && t145_value !== (t145_value = (ctx.InterventionAmt).toFixed(2) + "")) {
-    				set_data_dev(t145, t145_value);
+    			if ((!current || dirty[0] & /*InterventionAmt*/ 8192) && t145_value !== (t145_value = /*InterventionAmt*/ ctx[13].toFixed(2) + "")) set_data_dev(t145, t145_value);
+
+    			if (dirty[0] & /*InterventionAmt*/ 8192) {
+    				set_input_value(input0, /*InterventionAmt*/ ctx[13]);
     			}
 
-    			if (changed.InterventionAmt) set_input_value(input0, ctx.InterventionAmt);
-
-    			if (!current || changed.xScaleTime || changed.InterventionTime) {
-    				set_style(div68, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
-    				set_style(div68, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
+    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
+    				set_style(div68, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
     			}
 
-    			if (changed.xScaleTime || changed.milestones) {
-    				each_value = ctx.milestones;
+    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
+    				set_style(div68, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
+    				? "visible"
+    				: "hidden");
+    			}
 
+    			if (dirty[0] & /*xScaleTime*/ 134217728 | dirty[1] & /*milestones*/ 8) {
+    				each_value = /*milestones*/ ctx[34];
+    				validate_each_argument(each_value);
     				let i;
+
     				for (i = 0; i < each_value.length; i += 1) {
     					const child_ctx = get_each_context$1(ctx, each_value, i);
 
     					if (each_blocks[i]) {
-    						each_blocks[i].p(changed, child_ctx);
+    						each_blocks[i].p(child_ctx, dirty);
     						transition_in(each_blocks[i], 1);
     					} else {
     						each_blocks[i] = create_each_block$1(child_ctx);
@@ -25396,145 +26349,132 @@
     				}
 
     				group_outros();
+
     				for (i = each_value.length; i < each_blocks.length; i += 1) {
     					out(i);
     				}
+
     				check_outros();
     			}
 
-    			var checkbox7_changes = {};
-    			if (!updating_checked_6 && changed.log) {
-    				checkbox7_changes.checked = ctx.log;
+    			const checkbox7_changes = {};
+
+    			if (!updating_checked_6 && dirty[1] & /*log*/ 16) {
+    				updating_checked_6 = true;
+    				checkbox7_changes.checked = /*log*/ ctx[35];
+    				add_flush_callback(() => updating_checked_6 = false);
     			}
+
     			checkbox7.$set(checkbox7_changes);
 
-    			if (!current || changed.xScaleTime || changed.InterventionTime) {
-    				set_style(div73, "opacity", (ctx.xScaleTime(ctx.InterventionTime) >= 192? 1.0 : 0.2));
+    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
+    				set_style(div73, "opacity", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 192
+    				? 1
+    				: 0.2);
     			}
 
-    			if ((!current || changed.N) && t160_value !== (t160_value = format(",")(ctx.Math.round(ctx.N)) + "")) {
-    				set_data_dev(t160, t160_value);
+    			if ((!current || dirty[0] & /*N*/ 8) && t160_value !== (t160_value = format(",")(Math.round(/*N*/ ctx[3])) + "")) set_data_dev(t160, t160_value);
+
+    			if (dirty[0] & /*logN*/ 4) {
+    				set_input_value(input1, /*logN*/ ctx[2]);
     			}
 
-    			if (changed.logN) set_input_value(input1, ctx.logN);
+    			if (!current || dirty[0] & /*I0*/ 16) set_data_dev(t165, /*I0*/ ctx[4]);
 
-    			if (!current || changed.I0) {
-    				set_data_dev(t165, ctx.I0);
+    			if (dirty[0] & /*I0*/ 16) {
+    				set_input_value(input2, /*I0*/ ctx[4]);
     			}
 
-    			if (changed.I0) set_input_value(input2, ctx.I0);
+    			if (!current || dirty[0] & /*R0*/ 32) set_data_dev(t172, /*R0*/ ctx[5]);
 
-    			if (!current || changed.R0) {
-    				set_data_dev(t172, ctx.R0);
+    			if (dirty[0] & /*R0*/ 32) {
+    				set_input_value(input3, /*R0*/ ctx[5]);
     			}
 
-    			if (changed.R0) set_input_value(input3, ctx.R0);
+    			if ((!current || dirty[0] & /*D_incbation*/ 64) && t180_value !== (t180_value = /*D_incbation*/ ctx[6].toFixed(2) + "")) set_data_dev(t180, t180_value);
 
-    			if ((!current || changed.D_incbation) && t180_value !== (t180_value = (ctx.D_incbation).toFixed(2) + "")) {
-    				set_data_dev(t180, t180_value);
+    			if (dirty[0] & /*D_incbation*/ 64) {
+    				set_input_value(input4, /*D_incbation*/ ctx[6]);
     			}
 
-    			if (changed.D_incbation) set_input_value(input4, ctx.D_incbation);
+    			if (!current || dirty[0] & /*D_infectious*/ 128) set_data_dev(t187, /*D_infectious*/ ctx[7]);
 
-    			if (!current || changed.D_infectious) {
-    				set_data_dev(t187, ctx.D_infectious);
+    			if (dirty[0] & /*D_infectious*/ 128) {
+    				set_input_value(input5, /*D_infectious*/ ctx[7]);
     			}
 
-    			if (changed.D_infectious) set_input_value(input5, ctx.D_infectious);
+    			if ((!current || dirty[0] & /*CFR*/ 2048) && t196_value !== (t196_value = (/*CFR*/ ctx[11] * 100).toFixed(2) + "")) set_data_dev(t196, t196_value);
 
-    			if ((!current || changed.CFR) && t196_value !== (t196_value = (ctx.CFR*100).toFixed(2) + "")) {
-    				set_data_dev(t196, t196_value);
+    			if (dirty[0] & /*CFR*/ 2048) {
+    				set_input_value(input6, /*CFR*/ ctx[11]);
     			}
 
-    			if (changed.CFR) set_input_value(input6, ctx.CFR);
+    			if (!current || dirty[0] & /*Time_to_death*/ 2) set_data_dev(t202, /*Time_to_death*/ ctx[1]);
 
-    			if (!current || changed.Time_to_death) {
-    				set_data_dev(t202, ctx.Time_to_death);
-    			}
-
-    			if (changed.Time_to_death) set_input_value(input7, ctx.Time_to_death);
-
-    			if ((!current || changed.D_infectious) && input7_min_value !== (input7_min_value = (ctx.D_infectious)+0.1)) {
+    			if (!current || dirty[0] & /*D_infectious*/ 128 && input7_min_value !== (input7_min_value = /*D_infectious*/ ctx[7] + 0.1)) {
     				attr_dev(input7, "min", input7_min_value);
     			}
 
-    			if (!current || changed.D_recovery_severe) {
-    				set_data_dev(t210, ctx.D_recovery_severe);
+    			if (dirty[0] & /*Time_to_death*/ 2) {
+    				set_input_value(input7, /*Time_to_death*/ ctx[1]);
     			}
 
-    			if (changed.D_recovery_severe) set_input_value(input8, ctx.D_recovery_severe);
+    			if (!current || dirty[0] & /*D_recovery_severe*/ 512) set_data_dev(t210, /*D_recovery_severe*/ ctx[9]);
 
-    			if (!current || changed.D_recovery_mild) {
-    				set_data_dev(t216, ctx.D_recovery_mild);
+    			if (dirty[0] & /*D_recovery_severe*/ 512) {
+    				set_input_value(input8, /*D_recovery_severe*/ ctx[9]);
     			}
 
-    			if (changed.D_recovery_mild) set_input_value(input9, ctx.D_recovery_mild);
+    			if (!current || dirty[0] & /*D_recovery_mild*/ 256) set_data_dev(t216, /*D_recovery_mild*/ ctx[8]);
 
-    			if ((!current || changed.P_SEVERE) && t224_value !== (t224_value = (ctx.P_SEVERE*100).toFixed(2) + "")) {
-    				set_data_dev(t224, t224_value);
+    			if (dirty[0] & /*D_recovery_mild*/ 256) {
+    				set_input_value(input9, /*D_recovery_mild*/ ctx[8]);
     			}
 
-    			if (changed.P_SEVERE) set_input_value(input10, ctx.P_SEVERE);
+    			if ((!current || dirty[0] & /*P_SEVERE*/ 32768) && t224_value !== (t224_value = (/*P_SEVERE*/ ctx[15] * 100).toFixed(2) + "")) set_data_dev(t224, t224_value);
 
-    			if (!current || changed.D_hospital_lag) {
-    				set_data_dev(t230, ctx.D_hospital_lag);
+    			if (dirty[0] & /*P_SEVERE*/ 32768) {
+    				set_input_value(input10, /*P_SEVERE*/ ctx[15]);
     			}
 
-    			if (changed.D_hospital_lag) set_input_value(input11, ctx.D_hospital_lag);
+    			if (!current || dirty[0] & /*D_hospital_lag*/ 1024) set_data_dev(t230, /*D_hospital_lag*/ ctx[10]);
 
-    			if (!current || changed.ode_eqn) {
-    				span19.innerHTML = ctx.ode_eqn;
+    			if (dirty[0] & /*D_hospital_lag*/ 1024) {
+    				set_input_value(input11, /*D_hospital_lag*/ ctx[10]);
     			}
 
-    			if ((!current || changed.indexToTime || changed.active_) && t256_value !== (t256_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "")) {
-    				set_data_dev(t256, t256_value);
+    			if (!current || dirty[1] & /*ode_eqn*/ 1) span19.innerHTML = /*ode_eqn*/ ctx[31];			if ((!current || dirty[0] & /*indexToTime, active_*/ 1342177280) && t256_value !== (t256_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "")) set_data_dev(t256, t256_value);
+
+    			if (!current || dirty[1] & /*p_num_ind*/ 2) {
+    				set_style(input12, "width", Math.ceil(Math.log10(/*p_num_ind*/ ctx[32])) * 9.5 + 5 + "px");
     			}
 
-    			if (changed.p_num_ind && (input12.value !== ctx.p_num_ind)) set_input_value(input12, ctx.p_num_ind);
-
-    			if (!current || changed.p_num_ind) {
-    				set_style(input12, "width", "" + (ctx.Math.ceil(ctx.Math.log10(ctx.p_num_ind))*9.5 + 5) + "px");
+    			if (dirty[1] & /*p_num_ind*/ 2 && input12.value !== /*p_num_ind*/ ctx[32]) {
+    				set_input_value(input12, /*p_num_ind*/ ctx[32]);
     			}
 
-    			if ((!current || changed.Iters || changed.active_ || changed.p_num_ind) && t261_value !== (t261_value = ((1-(ctx.Math.pow(1 - (ctx.Iters[ctx.active_][2])*(0.45/100), ctx.p_num_ind)))*100).toFixed(5) + "")) {
-    				set_data_dev(t261, t261_value);
-    			}
+    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432 | dirty[1] & /*p_num_ind*/ 2) && t261_value !== (t261_value = ((1 - Math.pow(1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] * (0.45 / 100), /*p_num_ind*/ ctx[32])) * 100).toFixed(5) + "")) set_data_dev(t261, t261_value);
 
-    			if (!current || changed.state) {
-    				prop_dev(textarea, "value", ctx.state);
+    			if (!current || dirty[0] & /*state*/ 65536) {
+    				prop_dev(textarea, "value", /*state*/ ctx[16]);
     			}
     		},
-
     		i: function intro(local) {
     			if (current) return;
     			transition_in(checkbox0.$$.fragment, local);
-
     			transition_in(arrow0.$$.fragment, local);
-
     			transition_in(checkbox1.$$.fragment, local);
-
     			transition_in(arrow1.$$.fragment, local);
-
     			transition_in(checkbox2.$$.fragment, local);
-
     			transition_in(arrow2.$$.fragment, local);
-
     			transition_in(checkbox3.$$.fragment, local);
-
     			transition_in(arrow3.$$.fragment, local);
-
     			transition_in(checkbox4.$$.fragment, local);
-
     			transition_in(arrow4.$$.fragment, local);
-
     			transition_in(arrow5.$$.fragment, local);
-
     			transition_in(checkbox5.$$.fragment, local);
-
     			transition_in(arrow6.$$.fragment, local);
-
     			transition_in(checkbox6.$$.fragment, local);
-
     			transition_in(chart.$$.fragment, local);
 
     			for (let i = 0; i < each_value.length; i += 1) {
@@ -25542,10 +26482,8 @@
     			}
 
     			transition_in(checkbox7.$$.fragment, local);
-
     			current = true;
     		},
-
     		o: function outro(local) {
     			transition_out(checkbox0.$$.fragment, local);
     			transition_out(arrow0.$$.fragment, local);
@@ -25562,8 +26500,8 @@
     			transition_out(arrow6.$$.fragment, local);
     			transition_out(checkbox6.$$.fragment, local);
     			transition_out(chart.$$.fragment, local);
-
     			each_blocks = each_blocks.filter(Boolean);
+
     			for (let i = 0; i < each_blocks.length; i += 1) {
     				transition_out(each_blocks[i]);
     			}
@@ -25571,629 +26509,880 @@
     			transition_out(checkbox7.$$.fragment, local);
     			current = false;
     		},
-
     		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(link);
-    				detach_dev(t0);
-    				detach_dev(h2);
-    				detach_dev(t2);
-    				detach_dev(div75);
-    			}
-
+    			if (detaching) detach_dev(link);
+    			if (detaching) detach_dev(t0);
+    			if (detaching) detach_dev(h2);
+    			if (detaching) detach_dev(t2);
+    			if (detaching) detach_dev(div75);
     			destroy_component(checkbox0);
-
     			destroy_component(arrow0);
-
     			destroy_component(checkbox1);
-
     			destroy_component(arrow1);
-
     			destroy_component(checkbox2);
-
     			destroy_component(arrow2);
-
     			destroy_component(checkbox3);
-
     			destroy_component(arrow3);
-
     			destroy_component(checkbox4);
-
     			destroy_component(arrow4);
-
     			destroy_component(arrow5);
-
     			destroy_component(checkbox5);
-
     			destroy_component(arrow6);
-
     			destroy_component(checkbox6);
-
     			destroy_component(chart);
-
     			if (if_block) if_block.d();
-
     			destroy_each(each_blocks, detaching);
-
     			destroy_component(checkbox7);
-
-    			if (detaching) {
-    				detach_dev(t150);
-    				detach_dev(div117);
-    				detach_dev(t233);
-    				detach_dev(div118);
-    				detach_dev(t234);
-    				detach_dev(p0);
-    				detach_dev(t236);
-    				detach_dev(p1);
-    				detach_dev(t254);
-    				detach_dev(p2);
-    				detach_dev(t265);
-    				detach_dev(p3);
-    				detach_dev(t267);
-    				detach_dev(div119);
-    				detach_dev(t382);
-    				detach_dev(p4);
-    				detach_dev(t388);
-    				detach_dev(p5);
-    				detach_dev(t394);
-    				detach_dev(p6);
-    				detach_dev(t395);
-    				detach_dev(p7);
-    				detach_dev(t405);
-    				detach_dev(p8);
-    				detach_dev(t416);
-    				detach_dev(div122);
-    			}
-
+    			if (detaching) detach_dev(t150);
+    			if (detaching) detach_dev(div117);
+    			if (detaching) detach_dev(t233);
+    			if (detaching) detach_dev(div118);
+    			if (detaching) detach_dev(t234);
+    			if (detaching) detach_dev(p0);
+    			if (detaching) detach_dev(t236);
+    			if (detaching) detach_dev(p1);
+    			if (detaching) detach_dev(t254);
+    			if (detaching) detach_dev(p2);
+    			if (detaching) detach_dev(t265);
+    			if (detaching) detach_dev(p3);
+    			if (detaching) detach_dev(t267);
+    			if (detaching) detach_dev(div119);
+    			if (detaching) detach_dev(t382);
+    			if (detaching) detach_dev(p4);
+    			if (detaching) detach_dev(t388);
+    			if (detaching) detach_dev(p5);
+    			if (detaching) detach_dev(t396);
+    			if (detaching) detach_dev(p6);
+    			if (detaching) detach_dev(t406);
+    			if (detaching) detach_dev(p7);
+    			if (detaching) detach_dev(t417);
+    			if (detaching) detach_dev(div122);
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$3.name, type: "component", source: "", ctx });
+
+    	dispatch_dev("SvelteRegisterBlock", {
+    		block,
+    		id: create_fragment$3.name,
+    		type: "component",
+    		source: "",
+    		ctx
+    	});
+
     	return block;
     }
 
     const legendheight = 67;
 
-    let width$1  = 750;
-
-    let height$1 = 400;
-
-    var Tinc_s = "\\color{#CCC}{T^{-1}_{\\text{inc}}} ";
-
-    var Tinf_s = "\\color{#CCC}{T^{-1}_{\\text{inf}}}";
-
-    var Rt_s   = "\\color{#CCC}{\\frac{\\mathcal{R}_{t}}{T_{\\text{inf}}}} ";
+    function range$1(n) {
+    	return Array(n).fill().map((_, i) => i);
+    }
 
     function formatNumber$1(num) {
-      return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,')
+    	return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, "$1,");
     }
 
     function math_inline(str) {
-      return katex$1.renderToString(str, {
-      throwOnError: false,
-      displayMode: false,
-      colorIsTextColor: true
-      });
+    	return katex$1.renderToString(str, {
+    		throwOnError: false,
+    		displayMode: false,
+    		colorIsTextColor: true
+    	});
+    }
+
+    function math_display(str) {
+    	return katex$1.renderToString(str, {
+    		throwOnError: false,
+    		displayMode: true,
+    		colorIsTextColor: true
+    	});
     }
 
     function instance$3($$self, $$props, $$invalidate) {
-    	
+    	var sum = function (arr, bools) {
+    		var x = 0;
 
-      var sum = function(arr, bools){
-        var x = 0;
-        for (var i = 0; i < arr.length; i++) {
-          x = x + arr[i]*(bools[i] ? 1 : 0);
-        }
-        return x
-      };
+    		for (var i = 0; i < arr.length; i++) {
+    			x = x + arr[i] * (bools[i] ? 1 : 0);
+    		}
 
-      var Integrators = {
-        Euler    : [[1]],
-        Midpoint : [[.5,.5],[0, 1]],
-        Heun     : [[1, 1],[.5,.5]],
-        Ralston  : [[2/3,2/3],[.25,.75]],
-        K3       : [[.5,.5],[1,-1,2],[1/6,2/3,1/6]],
-        SSP33    : [[1,1],[.5,.25,.25],[1/6,1/6,2/3]],
-        SSP43    : [[.5,.5],[1,.5,.5],[.5,1/6,1/6,1/6],[1/6,1/6,1/6,1/2]],
-        RK4      : [[.5,.5],[.5,0,.5],[1,0,0,1],[1/6,1/3,1/3,1/6]],
-        RK38     : [[1/3,1/3],[2/3,-1/3,1],[1,1,-1,1],[1/8,3/8,3/8,1/8]]
-      };
+    		return x;
+    	};
 
-      // f is a func of time t and state y
-      // y is the initial state, t is the time, h is the timestep
-      // updated y is returned.
-      var integrate=(m,f,y,t,h)=>{
-        for (var k=[],ki=0; ki<m.length; ki++) {
-          var _y=y.slice(), dt=ki?((m[ki-1][0])*h):0;
-          for (var l=0; l<_y.length; l++) for (var j=1; j<=ki; j++) _y[l]=_y[l]+h*(m[ki-1][j])*(k[ki-1][l]);
-          k[ki]=f(t+dt,_y,dt); 
-        }
-        for (var r=y.slice(),l=0; l<_y.length; l++) for (var j=0; j<k.length; j++) r[l]=r[l]+h*(k[j][l])*(m[ki-1][j]);
-        return r;
-      };
+    	var Integrators = {
+    		Euler: [[1]],
+    		Midpoint: [[0.5, 0.5], [0, 1]],
+    		Heun: [[1, 1], [0.5, 0.5]],
+    		Ralston: [[2 / 3, 2 / 3], [0.25, 0.75]],
+    		K3: [[0.5, 0.5], [1, -1, 2], [1 / 6, 2 / 3, 1 / 6]],
+    		SSP33: [[1, 1], [0.5, 0.25, 0.25], [1 / 6, 1 / 6, 2 / 3]],
+    		SSP43: [
+    			[0.5, 0.5],
+    			[1, 0.5, 0.5],
+    			[0.5, 1 / 6, 1 / 6, 1 / 6],
+    			[1 / 6, 1 / 6, 1 / 6, 1 / 2]
+    		],
+    		RK4: [[0.5, 0.5], [0.5, 0, 0.5], [1, 0, 0, 1], [1 / 6, 1 / 3, 1 / 3, 1 / 6]],
+    		RK38: [
+    			[1 / 3, 1 / 3],
+    			[2 / 3, -1 / 3, 1],
+    			[1, 1, -1, 1],
+    			[1 / 8, 3 / 8, 3 / 8, 1 / 8]
+    		]
+    	};
 
-      function get_solution(dt, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, D_death, P_SEVERE, CFR, InterventionTime, InterventionAmt, duration) {
+    	// f is a func of time t and state y
+    	// y is the initial state, t is the time, h is the timestep
+    	// updated y is returned.
+    	var integrate = (m, f, y, t, h) => {
+    		for (var k = [], ki = 0; ki < m.length; ki++) {
+    			var _y = y.slice(), dt = ki ? m[ki - 1][0] * h : 0;
+    			for (var l = 0; l < _y.length; l++) for (var j = 1; j <= ki; j++) _y[l] = _y[l] + h * m[ki - 1][j] * k[ki - 1][l];
+    			k[ki] = f(t + dt, _y, dt);
+    		}
 
-        var interpolation_steps = 40;
-        var steps = 110*interpolation_steps;
-        var dt = dt/interpolation_steps;
-        var sample_step = interpolation_steps;
+    		for (var r = y.slice(), l = 0; l < _y.length; l++) for (var j = 0; j < k.length; j++) r[l] = r[l] + h * k[j][l] * m[ki - 1][j];
+    		return r;
+    	};
 
-        var method = Integrators["RK4"];
-        function f(t, x){
+    	function get_solution(
+    		dt,
+    	N,
+    	I0,
+    	R0,
+    	D_incbation,
+    	D_infectious,
+    	D_recovery_mild,
+    	D_hospital_lag,
+    	D_recovery_severe,
+    	D_death,
+    	P_SEVERE,
+    	CFR,
+    	InterventionTime,
+    	InterventionAmt,
+    	duration
+    	) {
+    		var interpolation_steps = 40;
+    		var steps = 110 * interpolation_steps;
+    		var dt = dt / interpolation_steps;
+    		var sample_step = interpolation_steps;
+    		var method = Integrators["RK4"];
 
-          // SEIR ODE
-          if (t > InterventionTime && t < InterventionTime + duration){
-            var beta = (InterventionAmt)*R0/(D_infectious);
-          } else if (t > InterventionTime + duration) {
-            var beta = 0.5*R0/(D_infectious);        
-          } else {
-            var beta = R0/(D_infectious);
-          }
-          var a     = 1/D_incbation;
-          var gamma = 1/D_infectious;
-          
-          var S        = x[0]; // Susectable
-          var E        = x[1]; // Exposed
-          var I        = x[2]; // Infectious 
-          var Mild     = x[3]; // Recovering (Mild)     
-          var Severe   = x[4]; // Recovering (Severe at home)
-          var Severe_H = x[5]; // Recovering (Severe in hospital)
-          var Fatal    = x[6]; // Recovering (Fatal)
-          var R_Mild   = x[7]; // Recovered
-          var R_Severe = x[8]; // Recovered
-          var R_Fatal  = x[9]; // Dead
+    		function f(t, x) {
+    			// SEIR ODE
+    			if (t > InterventionTime && t < InterventionTime + duration) {
+    				var beta = InterventionAmt * R0 / D_infectious;
+    			} else if (t > InterventionTime + duration) {
+    				var beta = 0.5 * R0 / D_infectious;
+    			} else {
+    				var beta = R0 / D_infectious;
+    			}
 
-          var p_severe = P_SEVERE;
-          var p_fatal  = CFR;
-          var p_mild   = 1 - P_SEVERE - CFR;
+    			var a = 1 / D_incbation;
+    			var gamma = 1 / D_infectious;
+    			var S = x[0]; // Susectable
+    			var E = x[1]; // Exposed
+    			var I = x[2]; // Infectious 
+    			var Mild = x[3]; // Recovering (Mild)     
+    			var Severe = x[4]; // Recovering (Severe at home)
+    			var Severe_H = x[5]; // Recovering (Severe in hospital)
+    			var Fatal = x[6]; // Recovering (Fatal)
+    			var R_Mild = x[7]; // Recovered
+    			var R_Severe = x[8]; // Recovered
+    			var R_Fatal = x[9]; // Dead
+    			var p_severe = P_SEVERE;
+    			var p_fatal = CFR;
+    			var p_mild = 1 - P_SEVERE - CFR;
+    			var dS = -beta * I * S;
+    			var dE = beta * I * S - a * E;
+    			var dI = a * E - gamma * I;
+    			var dMild = p_mild * gamma * I - 1 / D_recovery_mild * Mild;
+    			var dSevere = p_severe * gamma * I - 1 / D_hospital_lag * Severe;
+    			var dSevere_H = 1 / D_hospital_lag * Severe - 1 / D_recovery_severe * Severe_H;
+    			var dFatal = p_fatal * gamma * I - 1 / D_death * Fatal;
+    			var dR_Mild = 1 / D_recovery_mild * Mild;
+    			var dR_Severe = 1 / D_recovery_severe * Severe_H;
+    			var dR_Fatal = 1 / D_death * Fatal;
 
-          var dS        = -beta*I*S;
-          var dE        =  beta*I*S - a*E;
-          var dI        =  a*E - gamma*I;
-          var dMild     =  p_mild*gamma*I   - (1/D_recovery_mild)*Mild;
-          var dSevere   =  p_severe*gamma*I - (1/D_hospital_lag)*Severe;
-          var dSevere_H =  (1/D_hospital_lag)*Severe - (1/D_recovery_severe)*Severe_H;
-          var dFatal    =  p_fatal*gamma*I  - (1/D_death)*Fatal;
-          var dR_Mild   =  (1/D_recovery_mild)*Mild;
-          var dR_Severe =  (1/D_recovery_severe)*Severe_H;
-          var dR_Fatal  =  (1/D_death)*Fatal;
+    			//      0   1   2   3      4        5          6       7        8          9
+    			return [
+    				dS,
+    				dE,
+    				dI,
+    				dMild,
+    				dSevere,
+    				dSevere_H,
+    				dFatal,
+    				dR_Mild,
+    				dR_Severe,
+    				dR_Fatal
+    			];
+    		}
 
-          //      0   1   2   3      4        5          6       7        8          9
-          return [dS, dE, dI, dMild, dSevere, dSevere_H, dFatal, dR_Mild, dR_Severe, dR_Fatal]
-        }
+    		var v = [1, 0, I0 / (N - I0), 0, 0, 0, 0, 0, 0, 0];
+    		var t = 0;
+    		var P = [];
+    		var TI = [];
+    		var Iters = [];
 
-        var v = [1, 0, I0/(N-I0), 0, 0, 0, 0, 0, 0, 0];
-        var t = 0;
+    		while (steps--) {
+    			if ((steps + 1) % sample_step == 0) {
+    				//    Dead   Hospital          Recovered        Infected   Exposed
+    				P.push([N * v[9], N * (v[5] + v[6]), N * (v[7] + v[8]), N * v[2], N * v[1]]);
 
-        var P  = [];
-        var TI = [];
-        var Iters = [];
-        while (steps--) { 
-          if ((steps+1) % (sample_step) == 0) {
-                //    Dead   Hospital          Recovered        Infected   Exposed
-            P.push([ N*v[9], N*(v[5]+v[6]),  N*(v[7] + v[8]), N*v[2],    N*v[1] ]);
-            Iters.push(v);
-            TI.push(N*(1-v[0]));
-            // console.log((v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7] + v[8] + v[9]))
-            // console.log(v[0] , v[1] , v[2] , v[3] , v[4] , v[5] , v[6] , v[7] , v[8] , v[9])
-          }
-          v =integrate(method,f,v,t,dt); 
-          t+=dt;
-        }
-        return {"P": P, 
-                "deaths": N*v[6], 
-                "total": 1-v[0],
-                "total_infected": TI,
-                "Iters":Iters,
-                "dIters": f}
-      }
+    				Iters.push(v);
+    				TI.push(N * (1 - v[0]));
+    			} // console.log((v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7] + v[8] + v[9]))
+    			// console.log(v[0] , v[1] , v[2] , v[3] , v[4] , v[5] , v[6] , v[7] , v[8] , v[9])
 
-      function max(P, checked) {
-        return P.reduce((max, b) => Math.max(max, sum(b, checked) ), sum(P[0], checked) )
-      }
+    			v = integrate(method, f, v, t, dt);
+    			t += dt;
+    		}
 
-      var colors = [ "#386cb0", "#8da0cb", "#4daf4a", "#f0027f", "#fdc086"];
+    		return {
+    			P,
+    			"deaths": N * v[6],
+    			"total": 1 - v[0],
+    			"total_infected": TI,
+    			Iters,
+    			"dIters": f
+    		};
+    	}
 
-      var Plock = 1;
+    	function max(P, checked) {
+    		return P.reduce((max, b) => Math.max(max, sum(b, checked)), sum(P[0], checked));
+    	}
 
-      var drag_y = function (){
-        var dragstarty = 0;
-        var Pmaxstart = 0;
+    	var colors = ["#386cb0", "#8da0cb", "#4daf4a", "#f0027f", "#fdc086"];
+    	var Plock = 1;
 
-        var dragstarted = function (d) {
-          dragstarty = event.y;  
-          Pmaxstart  = Pmax;
-        };
+    	var drag_y = function () {
+    		var dragstarty = 0;
+    		var Pmaxstart = 0;
 
-        var dragged = function (d) {
-          $$invalidate('Pmax', Pmax = Math.max( (Pmaxstart*(1 + (event.y - dragstarty)/500)), 10));
-        };
+    		var dragstarted = function (d) {
+    			dragstarty = event.y;
+    			Pmaxstart = Pmax;
+    		};
 
-        return drag().on("drag", dragged).on("start", dragstarted)
-      };
+    		var dragged = function (d) {
+    			$$invalidate(24, Pmax = Math.max(Pmaxstart * (1 + (event.y - dragstarty) / 500), 10));
+    		};
 
-      var drag_x = function (){
-        var dragstartx = 0;
-        var dtstart = 0;
-        var dragstarted = function (d) {
-          dragstartx = event.x;
-          dtstart  = dt;
-          $$invalidate('Plock', Plock = Pmax);
-          $$invalidate('lock', lock = true);
-        };
-        var dragged = function (d) {
-          $$invalidate('dt', dt = dtstart - 0.0015*(event.x - dragstartx));
-        };
-        var dragend = function (d) {
-          $$invalidate('lock', lock = false);
-        };
-        return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend)
-      };
+    		return drag().on("drag", dragged).on("start", dragstarted);
+    	};
 
-      var drag_intervention = function (){
-        var dragstarty = 0;
-        var InterventionTimeStart = 0;
+    	var drag_x = function () {
+    		var dragstartx = 0;
+    		var dtstart = 0;
 
-        var dragstarted = function (d) {
-          dragstarty = event.x;  
-          InterventionTimeStart = InterventionTime;
-          $$invalidate('Plock', Plock = Pmax);
-          $$invalidate('lock', lock = true);
-        };
+    		var dragstarted = function (d) {
+    			dragstartx = event.x;
+    			dtstart = dt;
+    			$$invalidate(0, Plock = Pmax);
+    			$$invalidate(26, lock = true);
+    		};
 
-        var dragged = function (d) {
-          // InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
-          // console.log(event.x)
-          $$invalidate('InterventionTime', InterventionTime = Math.min(tmax-1, Math.max(0, InterventionTimeStart + xScaleTimeInv(event.x - dragstarty))));
-        };
+    		var dragged = function (d) {
+    			$$invalidate(43, dt = dtstart - 0.0015 * (event.x - dragstartx));
+    		};
 
-        var dragend = function (d) {
-          $$invalidate('lock', lock = false);
-        };
+    		var dragend = function (d) {
+    			$$invalidate(26, lock = false);
+    		};
 
-        return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend)
-      };
+    		return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend);
+    	};
 
+    	var drag_intervention = function () {
+    		var dragstarty = 0;
+    		var InterventionTimeStart = 0;
 
-      var drag_intervention_end = function (){
-        var dragstarty = 0;
-        var durationStart = 0;
+    		var dragstarted = function (d) {
+    			dragstarty = event.x;
+    			InterventionTimeStart = InterventionTime;
+    			$$invalidate(0, Plock = Pmax);
+    			$$invalidate(26, lock = true);
+    		};
 
-        var dragstarted = function (d) {
-          dragstarty = event.x;  
-          durationStart = duration;
-          $$invalidate('Plock', Plock = Pmax);
-          $$invalidate('lock', lock = true);
-        };
+    		var dragged = function (d) {
+    			// InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
+    			// console.log(event.x)
+    			$$invalidate(12, InterventionTime = Math.min(tmax - 1, Math.max(0, InterventionTimeStart + xScaleTimeInv(event.x - dragstarty))));
+    		};
 
-        var dragged = function (d) {
-          // InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
-          // console.log(event.x)
-          $$invalidate('duration', duration = Math.min(tmax-1, Math.max(0, durationStart + xScaleTimeInv(event.x - dragstarty))));
-        };
+    		var dragend = function (d) {
+    			$$invalidate(26, lock = false);
+    		};
 
-        var dragend = function (d) {
-          $$invalidate('lock', lock = false);
-        };
+    		return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend);
+    	};
 
-        return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend)
-      };
-      onMount(async () => {
-        var drag_callback_y = drag_y();
-        drag_callback_y(selectAll("#yAxisDrag"));
-        var drag_callback_x = drag_x();
-        drag_callback_x(selectAll("#xAxisDrag"));
-        var drag_callback_intervention = drag_intervention();
-        // drag_callback_intervention(selectAll("#interventionDrag"))
-        drag_callback_intervention(selectAll("#dottedline"));
-        // var drag_callback_intervention_end = drag_intervention_end()
-        // drag_callback_intervention_end(selectAll("#dottedline2"))
+    	var drag_intervention_end = function () {
+    		var dragstarty = 0;
+    		var durationStart = 0;
 
-        if (typeof window !== 'undefined') {
-          parsed = queryString.parse(window.location.search);
-          if (!(parsed.logN === undefined)) {$$invalidate('logN', logN = parsed.logN);}
-          if (!(parsed.I0 === undefined)) {$$invalidate('I0', I0 = parseFloat(parsed.I0));}
-          if (!(parsed.R0 === undefined)) {$$invalidate('R0', R0 = parseFloat(parsed.R0));}
-          if (!(parsed.D_incbation === undefined)) {$$invalidate('D_incbation', D_incbation = parseFloat(parsed.D_incbation));}
-          if (!(parsed.D_infectious === undefined)) {$$invalidate('D_infectious', D_infectious = parseFloat(parsed.D_infectious));}
-          if (!(parsed.D_recovery_mild === undefined)) {$$invalidate('D_recovery_mild', D_recovery_mild = parseFloat(parsed.D_recovery_mild));}
-          if (!(parsed.D_recovery_severe === undefined)) {$$invalidate('D_recovery_severe', D_recovery_severe = parseFloat(parsed.D_recovery_severe));}
-          if (!(parsed.CFR === undefined)) {$$invalidate('CFR', CFR = parseFloat(parsed.CFR));}
-          if (!(parsed.InterventionTime === undefined)) {$$invalidate('InterventionTime', InterventionTime = parseFloat(parsed.InterventionTime));}
-          if (!(parsed.InterventionAmt === undefined)) {$$invalidate('InterventionAmt', InterventionAmt = parseFloat(parsed.InterventionAmt));}
-          if (!(parsed.D_hospital_lag === undefined)) {$$invalidate('D_hospital_lag', D_hospital_lag = parseFloat(parsed.D_hospital_lag));}
-          if (!(parsed.P_SEVERE === undefined)) {$$invalidate('P_SEVERE', P_SEVERE = parseFloat(parsed.P_SEVERE));}
-        }
-      });
+    		var dragstarted = function (d) {
+    			dragstarty = event.x;
+    			durationStart = duration;
+    			$$invalidate(0, Plock = Pmax);
+    			$$invalidate(26, lock = true);
+    		};
 
-      function lock_yaxis(){
-        $$invalidate('Plock', Plock = Pmax);
-        $$invalidate('lock', lock  = true);
-      }
+    		var dragged = function (d) {
+    			// InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
+    			// console.log(event.x)
+    			$$invalidate(44, duration = Math.min(tmax - 1, Math.max(0, durationStart + xScaleTimeInv(event.x - dragstarty))));
+    		};
 
-      function unlock_yaxis(){
-        $$invalidate('lock', lock = false);
-      }
+    		var dragend = function (d) {
+    			$$invalidate(26, lock = false);
+    		};
 
-      const padding = { top: 20, right: 0, bottom: 20, left: 25 };
+    		return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend);
+    	};
 
-      window.addEventListener('mouseup', unlock_yaxis);
+    	onMount(async () => {
+    		var drag_callback_y = drag_y();
+    		drag_callback_y(selectAll("#yAxisDrag"));
+    		var drag_callback_x = drag_x();
+    		drag_callback_x(selectAll("#xAxisDrag"));
+    		var drag_callback_intervention = drag_intervention();
 
-      function get_milestones(P){
+    		// drag_callback_intervention(selectAll("#interventionDrag"))
+    		drag_callback_intervention(selectAll("#dottedline"));
 
-        function argmax(x, index) {
-          return x.map((x, i) => [x[index], i]).reduce((r, a) => (a[0] > r[0] ? a : r))[1];
-        }
+    		// var drag_callback_intervention_end = drag_intervention_end()
+    		// drag_callback_intervention_end(selectAll("#dottedline2"))
+    		if (typeof window !== "undefined") {
+    			parsed = queryString.parse(window.location.search);
 
-         //    Dead   Hospital          Recovered        Infected   Exposed
-        var milestones = [];
-        for (var i = 0; i < P.length; i++) {
-          if (P[i][0] >= 0.5) {
-            milestones.push([i*dt, "First death"]);
-            break
-          }
-        }
+    			if (!(parsed.logN === undefined)) {
+    				$$invalidate(2, logN = parsed.logN);
+    			}
 
-        var i = argmax(P, 1);
-        milestones.push([i*dt, "Peak: " + format(",")(Math.round(P[i][1])) + " hospitalizations"]);
+    			if (!(parsed.I0 === undefined)) {
+    				$$invalidate(4, I0 = parseFloat(parsed.I0));
+    			}
 
-        return milestones
-      }
+    			if (!(parsed.R0 === undefined)) {
+    				$$invalidate(5, R0 = parseFloat(parsed.R0));
+    			}
+
+    			if (!(parsed.D_incbation === undefined)) {
+    				$$invalidate(6, D_incbation = parseFloat(parsed.D_incbation));
+    			}
+
+    			if (!(parsed.D_infectious === undefined)) {
+    				$$invalidate(7, D_infectious = parseFloat(parsed.D_infectious));
+    			}
+
+    			if (!(parsed.D_recovery_mild === undefined)) {
+    				$$invalidate(8, D_recovery_mild = parseFloat(parsed.D_recovery_mild));
+    			}
+
+    			if (!(parsed.D_recovery_severe === undefined)) {
+    				$$invalidate(9, D_recovery_severe = parseFloat(parsed.D_recovery_severe));
+    			}
+
+    			if (!(parsed.CFR === undefined)) {
+    				$$invalidate(11, CFR = parseFloat(parsed.CFR));
+    			}
+
+    			if (!(parsed.InterventionTime === undefined)) {
+    				$$invalidate(12, InterventionTime = parseFloat(parsed.InterventionTime));
+    			}
+
+    			if (!(parsed.InterventionAmt === undefined)) {
+    				$$invalidate(13, InterventionAmt = parseFloat(parsed.InterventionAmt));
+    			}
+
+    			if (!(parsed.D_hospital_lag === undefined)) {
+    				$$invalidate(10, D_hospital_lag = parseFloat(parsed.D_hospital_lag));
+    			}
+
+    			if (!(parsed.P_SEVERE === undefined)) {
+    				$$invalidate(15, P_SEVERE = parseFloat(parsed.P_SEVERE));
+    			}
+    		}
+    	});
+
+    	function lock_yaxis() {
+    		$$invalidate(0, Plock = Pmax);
+    		$$invalidate(26, lock = true);
+    	}
+
+    	function unlock_yaxis() {
+    		$$invalidate(26, lock = false);
+    	}
+
+    	const padding = { top: 20, right: 0, bottom: 20, left: 25 };
+    	let width = 750;
+    	let height = 400;
+    	window.addEventListener("mouseup", unlock_yaxis);
+    	var Tinc_s = "\\color{#CCC}{T^{-1}_{\\text{inc}}} ";
+    	var Tinf_s = "\\color{#CCC}{T^{-1}_{\\text{inf}}}";
+    	var Rt_s = "\\color{#CCC}{\\frac{\\mathcal{R}_{t}}{T_{\\text{inf}}}} ";
+
+    	function get_milestones(P) {
+    		function argmax(x, index) {
+    			return x.map((x, i) => [x[index], i]).reduce((r, a) => a[0] > r[0] ? a : r)[1];
+    		}
+
+    		//    Dead   Hospital          Recovered        Infected   Exposed
+    		var milestones = [];
+
+    		for (var i = 0; i < P.length; i++) {
+    			if (P[i][0] >= 0.5) {
+    				milestones.push([i * dt, "First death"]);
+    				break;
+    			}
+    		}
+
+    		var i = argmax(P, 1);
+    		milestones.push([i * dt, "Peak: " + format(",")(Math.round(P[i][1])) + " hospitalizations"]);
+    		return milestones;
+    	}
+
+    	const writable_props = [];
+
+    	Object.keys($$props).forEach(key => {
+    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<App> was created with unknown prop '${key}'`);
+    	});
+
+    	let { $$slots = {}, $$scope } = $$props;
+    	validate_slots("App", $$slots, []);
 
     	function checkbox1_checked_binding(value) {
     		checked[4] = value;
-    		$$invalidate('checked', checked);
+    		$$invalidate(25, checked);
     	}
 
-    	function checkbox2_checked_binding(value_1) {
-    		checked[3] = value_1;
-    		$$invalidate('checked', checked);
+    	function checkbox2_checked_binding(value) {
+    		checked[3] = value;
+    		$$invalidate(25, checked);
     	}
 
-    	const func = (s) => {$$invalidate('checked', checked[1] = s, checked); $$invalidate('checked', checked[0] = s, checked); $$invalidate('checked', checked[2] = s, checked);};
+    	const func = s => {
+    		$$invalidate(25, checked[1] = s, checked);
+    		$$invalidate(25, checked[0] = s, checked);
+    		$$invalidate(25, checked[2] = s, checked);
+    	};
 
-    	function checkbox4_checked_binding(value_2) {
-    		checked[2] = value_2;
-    		$$invalidate('checked', checked);
+    	function checkbox4_checked_binding(value) {
+    		checked[2] = value;
+    		$$invalidate(25, checked);
     	}
 
-    	function checkbox5_checked_binding(value_3) {
-    		checked[1] = value_3;
-    		$$invalidate('checked', checked);
+    	function checkbox5_checked_binding(value) {
+    		checked[1] = value;
+    		$$invalidate(25, checked);
     	}
 
-    	function checkbox6_checked_binding(value_4) {
-    		checked[0] = value_4;
-    		$$invalidate('checked', checked);
+    	function checkbox6_checked_binding(value) {
+    		checked[0] = value;
+    		$$invalidate(25, checked);
     	}
 
-    	function chart_checked_binding(value_5) {
-    		checked = value_5;
-    		$$invalidate('checked', checked);
+    	function chart_checked_binding(value) {
+    		checked = value;
+    		$$invalidate(25, checked);
     	}
 
-    	function chart_active_binding(value_6) {
-    		active = value_6;
-    		$$invalidate('active', active);
+    	function chart_active_binding(value) {
+    		active = value;
+    		$$invalidate(29, active);
     	}
 
     	function input0_change_input_handler() {
     		InterventionAmt = to_number(this.value);
-    		$$invalidate('InterventionAmt', InterventionAmt);
+    		$$invalidate(13, InterventionAmt);
     	}
 
-    	function checkbox7_checked_binding(value_7) {
-    		log = value_7;
-    		$$invalidate('log', log);
+    	function checkbox7_checked_binding(value) {
+    		log = value;
+    		$$invalidate(35, log);
     	}
 
     	function input1_change_input_handler() {
     		logN = to_number(this.value);
-    		$$invalidate('logN', logN);
+    		$$invalidate(2, logN);
     	}
 
     	function input2_change_input_handler() {
     		I0 = to_number(this.value);
-    		$$invalidate('I0', I0);
+    		$$invalidate(4, I0);
     	}
 
     	function input3_change_input_handler() {
     		R0 = to_number(this.value);
-    		$$invalidate('R0', R0);
+    		$$invalidate(5, R0);
     	}
 
     	function input4_change_input_handler() {
     		D_incbation = to_number(this.value);
-    		$$invalidate('D_incbation', D_incbation);
+    		$$invalidate(6, D_incbation);
     	}
 
     	function input5_change_input_handler() {
     		D_infectious = to_number(this.value);
-    		$$invalidate('D_infectious', D_infectious);
+    		$$invalidate(7, D_infectious);
     	}
 
     	function input6_change_input_handler() {
     		CFR = to_number(this.value);
-    		$$invalidate('CFR', CFR);
+    		$$invalidate(11, CFR);
     	}
 
     	function input7_change_input_handler() {
     		Time_to_death = to_number(this.value);
-    		$$invalidate('Time_to_death', Time_to_death);
+    		$$invalidate(1, Time_to_death);
     	}
 
     	function input8_change_input_handler() {
     		D_recovery_severe = to_number(this.value);
-    		$$invalidate('D_recovery_severe', D_recovery_severe);
+    		$$invalidate(9, D_recovery_severe);
     	}
 
     	function input9_change_input_handler() {
     		D_recovery_mild = to_number(this.value);
-    		$$invalidate('D_recovery_mild', D_recovery_mild);
+    		$$invalidate(8, D_recovery_mild);
     	}
 
     	function input10_change_input_handler() {
     		P_SEVERE = to_number(this.value);
-    		$$invalidate('P_SEVERE', P_SEVERE);
+    		$$invalidate(15, P_SEVERE);
     	}
 
     	function input11_change_input_handler() {
     		D_hospital_lag = to_number(this.value);
-    		$$invalidate('D_hospital_lag', D_hospital_lag);
+    		$$invalidate(10, D_hospital_lag);
     	}
 
     	function input12_input_handler() {
     		p_num_ind = this.value;
-    		$$invalidate('p_num_ind', p_num_ind);
+    		$$invalidate(32, p_num_ind);
     	}
 
-    	$$self.$capture_state = () => {
-    		return {};
-    	};
-
-    	$$self.$inject_state = $$props => {
-    		if ('sum' in $$props) sum = $$props.sum;
-    		if ('Integrators' in $$props) Integrators = $$props.Integrators;
-    		if ('integrate' in $$props) integrate = $$props.integrate;
-    		if ('colors' in $$props) $$invalidate('colors', colors = $$props.colors);
-    		if ('Plock' in $$props) $$invalidate('Plock', Plock = $$props.Plock);
-    		if ('drag_y' in $$props) drag_y = $$props.drag_y;
-    		if ('drag_x' in $$props) drag_x = $$props.drag_x;
-    		if ('drag_intervention' in $$props) drag_intervention = $$props.drag_intervention;
-    		if ('drag_intervention_end' in $$props) drag_intervention_end = $$props.drag_intervention_end;
-    		if ('width' in $$props) $$invalidate('width', width$1 = $$props.width);
-    		if ('height' in $$props) $$invalidate('height', height$1 = $$props.height);
-    		if ('Tinc_s' in $$props) $$invalidate('Tinc_s', Tinc_s = $$props.Tinc_s);
-    		if ('Tinf_s' in $$props) $$invalidate('Tinf_s', Tinf_s = $$props.Tinf_s);
-    		if ('Rt_s' in $$props) $$invalidate('Rt_s', Rt_s = $$props.Rt_s);
-    		if ('Time_to_death' in $$props) $$invalidate('Time_to_death', Time_to_death = $$props.Time_to_death);
-    		if ('logN' in $$props) $$invalidate('logN', logN = $$props.logN);
-    		if ('N' in $$props) $$invalidate('N', N = $$props.N);
-    		if ('I0' in $$props) $$invalidate('I0', I0 = $$props.I0);
-    		if ('R0' in $$props) $$invalidate('R0', R0 = $$props.R0);
-    		if ('D_incbation' in $$props) $$invalidate('D_incbation', D_incbation = $$props.D_incbation);
-    		if ('D_infectious' in $$props) $$invalidate('D_infectious', D_infectious = $$props.D_infectious);
-    		if ('D_recovery_mild' in $$props) $$invalidate('D_recovery_mild', D_recovery_mild = $$props.D_recovery_mild);
-    		if ('D_recovery_severe' in $$props) $$invalidate('D_recovery_severe', D_recovery_severe = $$props.D_recovery_severe);
-    		if ('D_hospital_lag' in $$props) $$invalidate('D_hospital_lag', D_hospital_lag = $$props.D_hospital_lag);
-    		if ('D_death' in $$props) $$invalidate('D_death', D_death = $$props.D_death);
-    		if ('CFR' in $$props) $$invalidate('CFR', CFR = $$props.CFR);
-    		if ('InterventionTime' in $$props) $$invalidate('InterventionTime', InterventionTime = $$props.InterventionTime);
-    		if ('InterventionAmt' in $$props) $$invalidate('InterventionAmt', InterventionAmt = $$props.InterventionAmt);
-    		if ('Time' in $$props) Time = $$props.Time;
-    		if ('Xmax' in $$props) $$invalidate('Xmax', Xmax = $$props.Xmax);
-    		if ('dt' in $$props) $$invalidate('dt', dt = $$props.dt);
-    		if ('P_SEVERE' in $$props) $$invalidate('P_SEVERE', P_SEVERE = $$props.P_SEVERE);
-    		if ('duration' in $$props) $$invalidate('duration', duration = $$props.duration);
-    		if ('state' in $$props) $$invalidate('state', state = $$props.state);
-    		if ('Sol' in $$props) $$invalidate('Sol', Sol = $$props.Sol);
-    		if ('P' in $$props) $$invalidate('P', P = $$props.P);
-    		if ('timestep' in $$props) $$invalidate('timestep', timestep = $$props.timestep);
-    		if ('tmax' in $$props) $$invalidate('tmax', tmax = $$props.tmax);
-    		if ('deaths' in $$props) $$invalidate('deaths', deaths = $$props.deaths);
-    		if ('total' in $$props) $$invalidate('total', total = $$props.total);
-    		if ('total_infected' in $$props) $$invalidate('total_infected', total_infected = $$props.total_infected);
-    		if ('Iters' in $$props) $$invalidate('Iters', Iters = $$props.Iters);
-    		if ('dIters' in $$props) $$invalidate('dIters', dIters = $$props.dIters);
-    		if ('Pmax' in $$props) $$invalidate('Pmax', Pmax = $$props.Pmax);
-    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
-    		if ('lock' in $$props) $$invalidate('lock', lock = $$props.lock);
-    		if ('xScaleTimeInv' in $$props) xScaleTimeInv = $$props.xScaleTimeInv;
-    		if ('parsed' in $$props) parsed = $$props.parsed;
-    		if ('xScaleTime' in $$props) $$invalidate('xScaleTime', xScaleTime = $$props.xScaleTime);
-    		if ('indexToTime' in $$props) $$invalidate('indexToTime', indexToTime = $$props.indexToTime);
-    		if ('active' in $$props) $$invalidate('active', active = $$props.active);
-    		if ('active_' in $$props) $$invalidate('active_', active_ = $$props.active_);
-    		if ('ode_eqn' in $$props) $$invalidate('ode_eqn', ode_eqn = $$props.ode_eqn);
-    		if ('p_num_ind' in $$props) $$invalidate('p_num_ind', p_num_ind = $$props.p_num_ind);
-    		if ('get_d' in $$props) $$invalidate('get_d', get_d = $$props.get_d);
-    		if ('milestones' in $$props) $$invalidate('milestones', milestones = $$props.milestones);
-    		if ('log' in $$props) $$invalidate('log', log = $$props.log);
-    	};
-
-    	let Time_to_death, logN, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_recovery_severe, D_hospital_lag, D_death, CFR, InterventionTime, InterventionAmt, Time, Xmax, dt, P_SEVERE, duration, state, Sol, P, timestep, tmax, deaths, total, total_infected, Iters, dIters, Pmax, lock, parsed, xScaleTime, xScaleTimeInv, indexToTime, checked, active, active_, ode_eqn, p_num_ind, get_d, milestones, log;
-
-    	$$self.$$.update = ($$dirty = { logN: 1, Time_to_death: 1, D_infectious: 1, I0: 1, R0: 1, D_incbation: 1, D_recovery_mild: 1, D_recovery_severe: 1, CFR: 1, InterventionTime: 1, InterventionAmt: 1, D_hospital_lag: 1, P_SEVERE: 1, dt: 1, N: 1, D_death: 1, duration: 1, Sol: 1, P: 1, checked: 1, tmax: 1, width: 1, active: 1, Iters: 1, Rt_s: 1, Tinc_s: 1, Tinf_s: 1, dIters: 1, indexToTime: 1 }) => {
-    		if ($$dirty.logN) { $$invalidate('N', N                 = Math.exp(logN)); }
-    		if ($$dirty.Time_to_death || $$dirty.D_infectious) { $$invalidate('D_death', D_death           = Time_to_death - D_infectious); }
-    		if ($$dirty.Time_to_death || $$dirty.logN || $$dirty.I0 || $$dirty.R0 || $$dirty.D_incbation || $$dirty.D_infectious || $$dirty.D_recovery_mild || $$dirty.D_recovery_severe || $$dirty.CFR || $$dirty.InterventionTime || $$dirty.InterventionAmt || $$dirty.D_hospital_lag || $$dirty.P_SEVERE) { $$invalidate('state', state = location.protocol + '//' + location.host + location.pathname + "?" + queryString.stringify({"Time_to_death":Time_to_death,
-                       "logN":logN,
-                       "I0":I0,
-                       "R0":R0,
-                       "D_incbation":D_incbation,
-                       "D_infectious":D_infectious,
-                       "D_recovery_mild":D_recovery_mild,
-                       "D_recovery_severe":D_recovery_severe,
-                       "CFR":CFR,
-                       "InterventionTime":InterventionTime,
-                       "InterventionAmt":InterventionAmt,
-                       "D_hospital_lag":D_hospital_lag,
-                       "P_SEVERE": P_SEVERE})); }
-    		if ($$dirty.dt || $$dirty.N || $$dirty.I0 || $$dirty.R0 || $$dirty.D_incbation || $$dirty.D_infectious || $$dirty.D_recovery_mild || $$dirty.D_hospital_lag || $$dirty.D_recovery_severe || $$dirty.D_death || $$dirty.P_SEVERE || $$dirty.CFR || $$dirty.InterventionTime || $$dirty.InterventionAmt || $$dirty.duration) { $$invalidate('Sol', Sol            = get_solution(dt, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, D_death, P_SEVERE, CFR, InterventionTime, InterventionAmt, duration)); }
-    		if ($$dirty.Sol) { $$invalidate('P', P              = Sol["P"].slice(0,100)); }
-    		if ($$dirty.dt) { $$invalidate('timestep', timestep       = dt); }
-    		if ($$dirty.dt) { $$invalidate('tmax', tmax           = dt*100); }
-    		if ($$dirty.Sol) { $$invalidate('deaths', deaths         = Sol["deaths"]); }
-    		if ($$dirty.Sol) { $$invalidate('total', total          = Sol["total"]); }
-    		if ($$dirty.Sol) { $$invalidate('total_infected', total_infected = Sol["total_infected"].slice(0,100)); }
-    		if ($$dirty.Sol) { $$invalidate('Iters', Iters          = Sol["Iters"]); }
-    		if ($$dirty.Sol) { $$invalidate('dIters', dIters         = Sol["dIters"]); }
-    		if ($$dirty.P || $$dirty.checked) { $$invalidate('Pmax', Pmax           = max(P, checked)); }
-    		if ($$dirty.tmax || $$dirty.width) { $$invalidate('xScaleTime', xScaleTime = linear$1()
-            .domain([0, tmax])
-            .range([padding.left, width$1 - padding.right])); }
-    		if ($$dirty.width || $$dirty.tmax) { xScaleTimeInv = linear$1()
-            .domain([0, width$1])
-            .range([0, tmax]); }
-    		if ($$dirty.P || $$dirty.tmax) { $$invalidate('indexToTime', indexToTime = linear$1()
-            .domain([0, P.length])
-            .range([0, tmax])); }
-    		if ($$dirty.active || $$dirty.Iters) { $$invalidate('active_', active_ = active >= 0 ? active : Iters.length - 1); }
-    		if ($$dirty.Rt_s || $$dirty.Tinc_s || $$dirty.Tinf_s) { $$invalidate('ode_eqn', ode_eqn = katex$1.renderToString("\\frac{d S}{d t}=-" +Rt_s +"\\cdot IS,\\qquad \\frac{d E}{d t}=" +Rt_s +"\\cdot IS- " + Tinc_s + " E,\\qquad \\frac{d I}{d t}=" + Tinc_s + "E-" + Tinf_s+ "I, \\qquad \\frac{d R}{d t}=" + Tinf_s+ "I", {
-            throwOnError: false,
-            displayMode: true,
-            colorIsTextColor: true
-          })); }
-    		if ($$dirty.dIters || $$dirty.indexToTime || $$dirty.Iters) { $$invalidate('get_d', get_d = function(i){
-            return dIters(indexToTime(i), Iters[i])
-          }); }
-    		if ($$dirty.P) { $$invalidate('milestones', milestones = get_milestones(P)); }
-    	};
-
-    	$$invalidate('Time_to_death', Time_to_death     = 32);
-    	$$invalidate('logN', logN              = Math.log(7e6));
-    	$$invalidate('I0', I0                = 1);
-    	$$invalidate('R0', R0                = 2.2);
-    	$$invalidate('D_incbation', D_incbation       = 5.2);
-    	$$invalidate('D_infectious', D_infectious      = 2.9);
-    	$$invalidate('D_recovery_mild', D_recovery_mild   = (14 - 2.9));
-    	$$invalidate('D_recovery_severe', D_recovery_severe = (31.5 - 2.9));
-    	$$invalidate('D_hospital_lag', D_hospital_lag    = 5);
-    	$$invalidate('CFR', CFR               = 0.02);
-    	$$invalidate('InterventionTime', InterventionTime  = 100);
-    	$$invalidate('InterventionAmt', InterventionAmt   = 1/3);
-    	Time              = 220;
-    	$$invalidate('Xmax', Xmax              = 110000);
-    	$$invalidate('dt', dt                = 2);
-    	$$invalidate('P_SEVERE', P_SEVERE          = 0.2);
-    	$$invalidate('duration', duration          = 7*12*1e10);
-    	$$invalidate('checked', checked = [true, true, false, true, true]);
-    	$$invalidate('lock', lock           = false);
-    	parsed = "";
-    	$$invalidate('active', active  = 0);
-    	$$invalidate('p_num_ind', p_num_ind = 40);
-    	$$invalidate('log', log = true);
-
-    	return {
+    	$$self.$capture_state = () => ({
+    		scaleLinear: linear$1,
+    		Chart,
+    		onMount,
+    		selectAll,
+    		drag,
+    		queryString,
+    		Checkbox,
+    		Arrow,
+    		format,
+    		event,
+    		katex: katex$1,
+    		legendheight,
+    		range: range$1,
+    		formatNumber: formatNumber$1,
+    		sum,
+    		Integrators,
+    		integrate,
+    		get_solution,
+    		max,
     		colors,
     		Plock,
+    		drag_y,
+    		drag_x,
+    		drag_intervention,
+    		drag_intervention_end,
     		lock_yaxis,
+    		unlock_yaxis,
     		padding,
+    		width,
+    		height,
+    		Tinc_s,
+    		Tinf_s,
+    		Rt_s,
+    		math_inline,
+    		math_display,
+    		get_milestones,
     		Time_to_death,
     		logN,
-    		Math,
+    		N,
+    		I0,
+    		R0,
+    		D_incbation,
+    		D_infectious,
+    		D_recovery_mild,
+    		D_recovery_severe,
+    		D_hospital_lag,
+    		D_death,
+    		CFR,
+    		InterventionTime,
+    		InterventionAmt,
+    		Time,
+    		Xmax,
+    		dt,
+    		P_SEVERE,
+    		duration,
+    		state,
+    		Sol,
+    		P,
+    		timestep,
+    		tmax,
+    		deaths,
+    		total,
+    		total_infected,
+    		Iters,
+    		dIters,
+    		Pmax,
+    		checked,
+    		lock,
+    		xScaleTimeInv,
+    		parsed,
+    		xScaleTime,
+    		indexToTime,
+    		active,
+    		active_,
+    		ode_eqn,
+    		p_num_ind,
+    		get_d,
+    		milestones,
+    		log
+    	});
+
+    	$$self.$inject_state = $$props => {
+    		if ("sum" in $$props) sum = $$props.sum;
+    		if ("Integrators" in $$props) Integrators = $$props.Integrators;
+    		if ("integrate" in $$props) integrate = $$props.integrate;
+    		if ("colors" in $$props) $$invalidate(36, colors = $$props.colors);
+    		if ("Plock" in $$props) $$invalidate(0, Plock = $$props.Plock);
+    		if ("drag_y" in $$props) drag_y = $$props.drag_y;
+    		if ("drag_x" in $$props) drag_x = $$props.drag_x;
+    		if ("drag_intervention" in $$props) drag_intervention = $$props.drag_intervention;
+    		if ("drag_intervention_end" in $$props) drag_intervention_end = $$props.drag_intervention_end;
+    		if ("width" in $$props) $$invalidate(39, width = $$props.width);
+    		if ("height" in $$props) $$invalidate(40, height = $$props.height);
+    		if ("Tinc_s" in $$props) $$invalidate(59, Tinc_s = $$props.Tinc_s);
+    		if ("Tinf_s" in $$props) $$invalidate(60, Tinf_s = $$props.Tinf_s);
+    		if ("Rt_s" in $$props) $$invalidate(61, Rt_s = $$props.Rt_s);
+    		if ("Time_to_death" in $$props) $$invalidate(1, Time_to_death = $$props.Time_to_death);
+    		if ("logN" in $$props) $$invalidate(2, logN = $$props.logN);
+    		if ("N" in $$props) $$invalidate(3, N = $$props.N);
+    		if ("I0" in $$props) $$invalidate(4, I0 = $$props.I0);
+    		if ("R0" in $$props) $$invalidate(5, R0 = $$props.R0);
+    		if ("D_incbation" in $$props) $$invalidate(6, D_incbation = $$props.D_incbation);
+    		if ("D_infectious" in $$props) $$invalidate(7, D_infectious = $$props.D_infectious);
+    		if ("D_recovery_mild" in $$props) $$invalidate(8, D_recovery_mild = $$props.D_recovery_mild);
+    		if ("D_recovery_severe" in $$props) $$invalidate(9, D_recovery_severe = $$props.D_recovery_severe);
+    		if ("D_hospital_lag" in $$props) $$invalidate(10, D_hospital_lag = $$props.D_hospital_lag);
+    		if ("D_death" in $$props) $$invalidate(41, D_death = $$props.D_death);
+    		if ("CFR" in $$props) $$invalidate(11, CFR = $$props.CFR);
+    		if ("InterventionTime" in $$props) $$invalidate(12, InterventionTime = $$props.InterventionTime);
+    		if ("InterventionAmt" in $$props) $$invalidate(13, InterventionAmt = $$props.InterventionAmt);
+    		if ("Time" in $$props) Time = $$props.Time;
+    		if ("Xmax" in $$props) $$invalidate(14, Xmax = $$props.Xmax);
+    		if ("dt" in $$props) $$invalidate(43, dt = $$props.dt);
+    		if ("P_SEVERE" in $$props) $$invalidate(15, P_SEVERE = $$props.P_SEVERE);
+    		if ("duration" in $$props) $$invalidate(44, duration = $$props.duration);
+    		if ("state" in $$props) $$invalidate(16, state = $$props.state);
+    		if ("Sol" in $$props) $$invalidate(45, Sol = $$props.Sol);
+    		if ("P" in $$props) $$invalidate(17, P = $$props.P);
+    		if ("timestep" in $$props) $$invalidate(18, timestep = $$props.timestep);
+    		if ("tmax" in $$props) $$invalidate(19, tmax = $$props.tmax);
+    		if ("deaths" in $$props) $$invalidate(20, deaths = $$props.deaths);
+    		if ("total" in $$props) $$invalidate(21, total = $$props.total);
+    		if ("total_infected" in $$props) $$invalidate(22, total_infected = $$props.total_infected);
+    		if ("Iters" in $$props) $$invalidate(23, Iters = $$props.Iters);
+    		if ("dIters" in $$props) $$invalidate(46, dIters = $$props.dIters);
+    		if ("Pmax" in $$props) $$invalidate(24, Pmax = $$props.Pmax);
+    		if ("checked" in $$props) $$invalidate(25, checked = $$props.checked);
+    		if ("lock" in $$props) $$invalidate(26, lock = $$props.lock);
+    		if ("xScaleTimeInv" in $$props) xScaleTimeInv = $$props.xScaleTimeInv;
+    		if ("parsed" in $$props) parsed = $$props.parsed;
+    		if ("xScaleTime" in $$props) $$invalidate(27, xScaleTime = $$props.xScaleTime);
+    		if ("indexToTime" in $$props) $$invalidate(28, indexToTime = $$props.indexToTime);
+    		if ("active" in $$props) $$invalidate(29, active = $$props.active);
+    		if ("active_" in $$props) $$invalidate(30, active_ = $$props.active_);
+    		if ("ode_eqn" in $$props) $$invalidate(31, ode_eqn = $$props.ode_eqn);
+    		if ("p_num_ind" in $$props) $$invalidate(32, p_num_ind = $$props.p_num_ind);
+    		if ("get_d" in $$props) $$invalidate(33, get_d = $$props.get_d);
+    		if ("milestones" in $$props) $$invalidate(34, milestones = $$props.milestones);
+    		if ("log" in $$props) $$invalidate(35, log = $$props.log);
+    	};
+
+    	let Time_to_death;
+    	let logN;
+    	let N;
+    	let I0;
+    	let R0;
+    	let D_incbation;
+    	let D_infectious;
+    	let D_recovery_mild;
+    	let D_recovery_severe;
+    	let D_hospital_lag;
+    	let D_death;
+    	let CFR;
+    	let InterventionTime;
+    	let InterventionAmt;
+    	let Time;
+    	let Xmax;
+    	let dt;
+    	let P_SEVERE;
+    	let duration;
+    	let state;
+    	let Sol;
+    	let P;
+    	let timestep;
+    	let tmax;
+    	let deaths;
+    	let total;
+    	let total_infected;
+    	let Iters;
+    	let dIters;
+    	let Pmax;
+    	let lock;
+    	let parsed;
+    	let xScaleTime;
+    	let xScaleTimeInv;
+    	let indexToTime;
+    	let checked;
+    	let active;
+    	let active_;
+    	let ode_eqn;
+    	let p_num_ind;
+    	let get_d;
+    	let milestones;
+    	let log;
+
+    	if ($$props && "$$inject" in $$props) {
+    		$$self.$inject_state($$props.$$inject);
+    	}
+
+    	$$self.$$.update = () => {
+    		if ($$self.$$.dirty[0] & /*logN*/ 4) {
+    			 $$invalidate(3, N = Math.exp(logN));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*Time_to_death, D_infectious*/ 130) {
+    			 $$invalidate(41, D_death = Time_to_death - D_infectious);
+    		}
+
+    		if ($$self.$$.dirty[0] & /*Time_to_death, logN, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_recovery_severe, CFR, InterventionTime, InterventionAmt, D_hospital_lag, P_SEVERE*/ 49142) {
+    			 $$invalidate(16, state = location.protocol + "//" + location.host + location.pathname + "?" + queryString.stringify({
+    				Time_to_death,
+    				logN,
+    				I0,
+    				R0,
+    				D_incbation,
+    				D_infectious,
+    				D_recovery_mild,
+    				D_recovery_severe,
+    				CFR,
+    				InterventionTime,
+    				InterventionAmt,
+    				D_hospital_lag,
+    				P_SEVERE
+    			}));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, P_SEVERE, CFR, InterventionTime, InterventionAmt*/ 49144 | $$self.$$.dirty[1] & /*dt, D_death, duration*/ 13312) {
+    			 $$invalidate(45, Sol = get_solution(dt, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, D_death, P_SEVERE, CFR, InterventionTime, InterventionAmt, duration));
+    		}
+
+    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
+    			 $$invalidate(17, P = Sol["P"].slice(0, 100));
+    		}
+
+    		if ($$self.$$.dirty[1] & /*dt*/ 4096) {
+    			 $$invalidate(18, timestep = dt);
+    		}
+
+    		if ($$self.$$.dirty[1] & /*dt*/ 4096) {
+    			 $$invalidate(19, tmax = dt * 100);
+    		}
+
+    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
+    			 $$invalidate(20, deaths = Sol["deaths"]);
+    		}
+
+    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
+    			 $$invalidate(21, total = Sol["total"]);
+    		}
+
+    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
+    			 $$invalidate(22, total_infected = Sol["total_infected"].slice(0, 100));
+    		}
+
+    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
+    			 $$invalidate(23, Iters = Sol["Iters"]);
+    		}
+
+    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
+    			 $$invalidate(46, dIters = Sol["dIters"]);
+    		}
+
+    		if ($$self.$$.dirty[0] & /*P, checked*/ 33685504) {
+    			 $$invalidate(24, Pmax = max(P, checked));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*tmax*/ 524288) {
+    			 $$invalidate(27, xScaleTime = linear$1().domain([0, tmax]).range([padding.left, width - padding.right]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*tmax*/ 524288) {
+    			 xScaleTimeInv = linear$1().domain([0, width]).range([0, tmax]);
+    		}
+
+    		if ($$self.$$.dirty[0] & /*P, tmax*/ 655360) {
+    			 $$invalidate(28, indexToTime = linear$1().domain([0, P.length]).range([0, tmax]));
+    		}
+
+    		if ($$self.$$.dirty[0] & /*active, Iters*/ 545259520) {
+    			 $$invalidate(30, active_ = active >= 0 ? active : Iters.length - 1);
+    		}
+
+    		if ($$self.$$.dirty[0] & /*indexToTime, Iters*/ 276824064 | $$self.$$.dirty[1] & /*dIters*/ 32768) {
+    			 $$invalidate(33, get_d = function (i) {
+    				return dIters(indexToTime(i), Iters[i]);
+    			});
+    		}
+
+    		if ($$self.$$.dirty[0] & /*P*/ 131072) {
+    			 $$invalidate(34, milestones = get_milestones(P));
+    		}
+    	};
+
+    	 $$invalidate(1, Time_to_death = 32);
+    	 $$invalidate(2, logN = Math.log(7000000));
+    	 $$invalidate(4, I0 = 1);
+    	 $$invalidate(5, R0 = 2.2);
+    	 $$invalidate(6, D_incbation = 5.2);
+    	 $$invalidate(7, D_infectious = 2.9);
+    	 $$invalidate(8, D_recovery_mild = 14 - 2.9);
+    	 $$invalidate(9, D_recovery_severe = 31.5 - 2.9);
+    	 $$invalidate(10, D_hospital_lag = 5);
+    	 $$invalidate(11, CFR = 0.02);
+    	 $$invalidate(12, InterventionTime = 100);
+    	 $$invalidate(13, InterventionAmt = 1 / 3);
+    	 Time = 220;
+    	 $$invalidate(14, Xmax = 110000);
+    	 $$invalidate(43, dt = 2);
+    	 $$invalidate(15, P_SEVERE = 0.2);
+    	 $$invalidate(44, duration = 7 * 12 * 10000000000);
+    	 $$invalidate(25, checked = [true, true, false, true, true]);
+    	 $$invalidate(26, lock = false);
+    	 parsed = "";
+    	 $$invalidate(29, active = 0);
+
+    	 $$invalidate(31, ode_eqn = katex$1.renderToString("\\frac{d S}{d t}=-" + Rt_s + "\\cdot IS,\\qquad \\frac{d E}{d t}=" + Rt_s + "\\cdot IS- " + Tinc_s + " E,\\qquad \\frac{d I}{d t}=" + Tinc_s + "E-" + Tinf_s + "I, \\qquad \\frac{d R}{d t}=" + Tinf_s + "I", {
+    		throwOnError: false,
+    		displayMode: true,
+    		colorIsTextColor: true
+    	}));
+
+    	 $$invalidate(32, p_num_ind = 40);
+    	 $$invalidate(35, log = true);
+
+    	return [
+    		Plock,
+    		Time_to_death,
+    		logN,
     		N,
     		I0,
     		R0,
@@ -26227,6 +27416,33 @@
     		get_d,
     		milestones,
     		log,
+    		colors,
+    		lock_yaxis,
+    		padding,
+    		width,
+    		height,
+    		D_death,
+    		Time,
+    		dt,
+    		duration,
+    		Sol,
+    		dIters,
+    		xScaleTimeInv,
+    		parsed,
+    		sum,
+    		Integrators,
+    		integrate,
+    		get_solution,
+    		max,
+    		drag_y,
+    		drag_x,
+    		drag_intervention,
+    		drag_intervention_end,
+    		unlock_yaxis,
+    		Tinc_s,
+    		Tinf_s,
+    		Rt_s,
+    		get_milestones,
     		checkbox1_checked_binding,
     		checkbox2_checked_binding,
     		func,
@@ -26249,14 +27465,20 @@
     		input10_change_input_handler,
     		input11_change_input_handler,
     		input12_input_handler
-    	};
+    	];
     }
 
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$3, create_fragment$3, safe_not_equal, []);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "App", options, id: create_fragment$3.name });
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {}, [-1, -1, -1]);
+
+    		dispatch_dev("SvelteRegisterComponent", {
+    			component: this,
+    			tagName: "App",
+    			options,
+    			id: create_fragment$3.name
+    		});
     	}
     }
 
