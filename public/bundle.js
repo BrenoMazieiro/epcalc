@@ -60,7 +60,7 @@
     function attr(node, attribute, value) {
         if (value == null)
             node.removeAttribute(attribute);
-        else if (node.getAttribute(attribute) !== value)
+        else
             node.setAttribute(attribute, value);
     }
     function to_number(value) {
@@ -120,20 +120,6 @@
     function onMount(fn) {
         get_current_component().$$.on_mount.push(fn);
     }
-    function createEventDispatcher() {
-        const component = get_current_component();
-        return (type, detail) => {
-            const callbacks = component.$$.callbacks[type];
-            if (callbacks) {
-                // TODO are there situations where events could be dispatched
-                // in a server (non-DOM) environment?
-                const event = custom_event(type, detail);
-                callbacks.slice().forEach(fn => {
-                    fn.call(component, event);
-                });
-            }
-        };
-    }
 
     const dirty_components = [];
     const binding_callbacks = [];
@@ -153,21 +139,16 @@
     function add_flush_callback(fn) {
         flush_callbacks.push(fn);
     }
-    let flushing = false;
-    const seen_callbacks = new Set();
     function flush() {
-        if (flushing)
-            return;
-        flushing = true;
+        const seen_callbacks = new Set();
         do {
             // first, call beforeUpdate functions
             // and update components
-            for (let i = 0; i < dirty_components.length; i += 1) {
-                const component = dirty_components[i];
+            while (dirty_components.length) {
+                const component = dirty_components.shift();
                 set_current_component(component);
                 update(component.$$);
             }
-            dirty_components.length = 0;
             while (binding_callbacks.length)
                 binding_callbacks.pop()();
             // then, once components are updated, call
@@ -176,9 +157,9 @@
             for (let i = 0; i < render_callbacks.length; i += 1) {
                 const callback = render_callbacks[i];
                 if (!seen_callbacks.has(callback)) {
+                    callback();
                     // ...so guard against infinite loops
                     seen_callbacks.add(callback);
-                    callback();
                 }
             }
             render_callbacks.length = 0;
@@ -187,16 +168,13 @@
             flush_callbacks.pop()();
         }
         update_scheduled = false;
-        flushing = false;
-        seen_callbacks.clear();
     }
     function update($$) {
-        if ($$.fragment !== null) {
-            $$.update();
+        if ($$.fragment) {
+            $$.update($$.dirty);
             run_all($$.before_update);
-            const dirty = $$.dirty;
-            $$.dirty = [-1];
-            $$.fragment && $$.fragment.p($$.ctx, dirty);
+            $$.fragment.p($$.dirty, $$.ctx);
+            $$.dirty = null;
             $$.after_update.forEach(add_render_callback);
         }
     }
@@ -239,18 +217,14 @@
     }
 
     function bind(component, name, callback) {
-        const index = component.$$.props[name];
-        if (index !== undefined) {
-            component.$$.bound[index] = callback;
-            callback(component.$$.ctx[index]);
-        }
-    }
-    function create_component(block) {
-        block && block.c();
+        if (component.$$.props.indexOf(name) === -1)
+            return;
+        component.$$.bound[name] = callback;
+        callback(component.$$.ctx[name]);
     }
     function mount_component(component, target, anchor) {
         const { fragment, on_mount, on_destroy, after_update } = component.$$;
-        fragment && fragment.m(target, anchor);
+        fragment.m(target, anchor);
         // onMount happens before the initial afterUpdate
         add_render_callback(() => {
             const new_on_destroy = on_mount.map(run).filter(is_function);
@@ -267,33 +241,32 @@
         after_update.forEach(add_render_callback);
     }
     function destroy_component(component, detaching) {
-        const $$ = component.$$;
-        if ($$.fragment !== null) {
-            run_all($$.on_destroy);
-            $$.fragment && $$.fragment.d(detaching);
+        if (component.$$.fragment) {
+            run_all(component.$$.on_destroy);
+            component.$$.fragment.d(detaching);
             // TODO null out other refs, including component.$$ (but need to
             // preserve final state?)
-            $$.on_destroy = $$.fragment = null;
-            $$.ctx = [];
+            component.$$.on_destroy = component.$$.fragment = null;
+            component.$$.ctx = {};
         }
     }
-    function make_dirty(component, i) {
-        if (component.$$.dirty[0] === -1) {
+    function make_dirty(component, key) {
+        if (!component.$$.dirty) {
             dirty_components.push(component);
             schedule_update();
-            component.$$.dirty.fill(0);
+            component.$$.dirty = blank_object();
         }
-        component.$$.dirty[(i / 31) | 0] |= (1 << (i % 31));
+        component.$$.dirty[key] = true;
     }
-    function init(component, options, instance, create_fragment, not_equal, props, dirty = [-1]) {
+    function init(component, options, instance, create_fragment, not_equal, prop_names) {
         const parent_component = current_component;
         set_current_component(component);
-        const prop_values = options.props || {};
+        const props = options.props || {};
         const $$ = component.$$ = {
             fragment: null,
             ctx: null,
             // state
-            props,
+            props: prop_names,
             update: noop,
             not_equal,
             bound: blank_object(),
@@ -305,36 +278,32 @@
             context: new Map(parent_component ? parent_component.$$.context : []),
             // everything else
             callbacks: blank_object(),
-            dirty
+            dirty: null
         };
         let ready = false;
         $$.ctx = instance
-            ? instance(component, prop_values, (i, ret, ...rest) => {
-                const value = rest.length ? rest[0] : ret;
-                if ($$.ctx && not_equal($$.ctx[i], $$.ctx[i] = value)) {
-                    if ($$.bound[i])
-                        $$.bound[i](value);
+            ? instance(component, props, (key, ret, value = ret) => {
+                if ($$.ctx && not_equal($$.ctx[key], $$.ctx[key] = value)) {
+                    if ($$.bound[key])
+                        $$.bound[key](value);
                     if (ready)
-                        make_dirty(component, i);
+                        make_dirty(component, key);
                 }
                 return ret;
             })
-            : [];
+            : props;
         $$.update();
         ready = true;
         run_all($$.before_update);
-        // `false` as a special case of no DOM component
-        $$.fragment = create_fragment ? create_fragment($$.ctx) : false;
+        $$.fragment = create_fragment($$.ctx);
         if (options.target) {
             if (options.hydrate) {
-                const nodes = children(options.target);
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                $$.fragment && $$.fragment.l(nodes);
-                nodes.forEach(detach);
+                $$.fragment.l(children(options.target));
             }
             else {
                 // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-                $$.fragment && $$.fragment.c();
+                $$.fragment.c();
             }
             if (options.intro)
                 transition_in(component.$$.fragment);
@@ -363,7 +332,7 @@
     }
 
     function dispatch_dev(type, detail) {
-        document.dispatchEvent(custom_event(type, Object.assign({ version: '3.20.1' }, detail)));
+        document.dispatchEvent(custom_event(type, detail));
     }
     function append_dev(target, node) {
         dispatch_dev("SvelteDOMInsert", { target, node });
@@ -408,22 +377,6 @@
         dispatch_dev("SvelteDOMSetData", { node: text, data });
         text.data = data;
     }
-    function validate_each_argument(arg) {
-        if (typeof arg !== 'string' && !(arg && typeof arg === 'object' && 'length' in arg)) {
-            let msg = '{#each} only iterates over array-like objects.';
-            if (typeof Symbol === 'function' && arg && Symbol.iterator in arg) {
-                msg += ' You can use a spread to convert this iterable into an array.';
-            }
-            throw new Error(msg);
-        }
-    }
-    function validate_slots(name, slot, keys) {
-        for (const slot_key of Object.keys(slot)) {
-            if (!~keys.indexOf(slot_key)) {
-                console.warn(`<${name}> received an unexpected slot "${slot_key}".`);
-            }
-        }
-    }
     class SvelteComponentDev extends SvelteComponent {
         constructor(options) {
             if (!options || (!options.target && !options.$$inline)) {
@@ -437,8 +390,6 @@
                 console.warn(`Component was already destroyed`); // eslint-disable-line no-console
             };
         }
-        $capture_state() { }
-        $inject_state() { }
     }
 
     function ascending(a, b) {
@@ -3050,58 +3001,43 @@
       return drag;
     }
 
-    /* src/Chart.svelte generated by Svelte v3.20.1 */
+    /* src/Chart.svelte generated by Svelte v3.12.1 */
+
     const file = "src/Chart.svelte";
 
     function get_each_context(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[44] = list[i];
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.i = list[i];
     	return child_ctx;
     }
 
     function get_each_context_2(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[49] = list[i];
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.j = list[i];
     	return child_ctx;
     }
 
     function get_each_context_1(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[44] = list[i];
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.i = list[i];
     	return child_ctx;
     }
 
     function get_each_context_3(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[44] = list[i];
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.i = list[i];
     	return child_ctx;
     }
 
     function get_each_context_4(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[54] = list[i];
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.tick = list[i];
     	return child_ctx;
     }
 
     // (189:6) {#each yScale.ticks(5) as tick}
     function create_each_block_4(ctx) {
-    	let g;
-    	let line;
-    	let text_1;
-
-    	let t0_value = (Number.isInteger(Math.log10(/*tick*/ ctx[54]))
-    	? formatNumber(/*tick*/ ctx[54])
-    	: /*log*/ ctx[3] ? "" : formatNumber(/*tick*/ ctx[54])) + "";
-
-    	let t0;
-
-    	let t1_value = (/*tick*/ ctx[54] == /*yScale*/ ctx[10].ticks(5)[0]
-    	? " "
-    	: "") + "";
-
-    	let t1;
-    	let g_class_value;
-    	let g_transform_value;
+    	var g, line, text_1, t0_value = Number.isInteger(ctx.Math.log10(ctx.tick)) ? formatNumber(ctx.tick) : (ctx.log ? "": formatNumber(ctx.tick)) + "", t0, t1_value = (ctx.tick == ctx.yScale.ticks(5)[0]) ? " ": "" + "", t1, g_class_value, g_transform_value;
 
     	const block = {
     		c: function create() {
@@ -3116,10 +3052,11 @@
     			attr_dev(text_1, "y", "-4");
     			attr_dev(text_1, "class", "svelte-1hzt5y0");
     			add_location(text_1, file, 191, 10, 4026);
-    			attr_dev(g, "class", g_class_value = "tick tick-" + /*tick*/ ctx[54] + " svelte-1hzt5y0");
-    			attr_dev(g, "transform", g_transform_value = "translate(0, " + (/*yScale*/ ctx[10](/*tick*/ ctx[54]) - /*padding*/ ctx[15].bottom) + ")");
+    			attr_dev(g, "class", g_class_value = "tick tick-" + ctx.tick + " svelte-1hzt5y0");
+    			attr_dev(g, "transform", g_transform_value = "translate(0, " + (ctx.yScale(ctx.tick) - ctx.padding.bottom) + ")");
     			add_location(g, file, 189, 8, 3895);
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, g, anchor);
     			append_dev(g, line);
@@ -3127,48 +3064,38 @@
     			append_dev(text_1, t0);
     			append_dev(text_1, t1);
     		},
-    		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*yScale, log*/ 1032 && t0_value !== (t0_value = (Number.isInteger(Math.log10(/*tick*/ ctx[54]))
-    			? formatNumber(/*tick*/ ctx[54])
-    			: /*log*/ ctx[3] ? "" : formatNumber(/*tick*/ ctx[54])) + "")) set_data_dev(t0, t0_value);
 
-    			if (dirty[0] & /*yScale*/ 1024 && t1_value !== (t1_value = (/*tick*/ ctx[54] == /*yScale*/ ctx[10].ticks(5)[0]
-    			? " "
-    			: "") + "")) set_data_dev(t1, t1_value);
+    		p: function update(changed, ctx) {
+    			if ((changed.yScale || changed.log) && t0_value !== (t0_value = Number.isInteger(ctx.Math.log10(ctx.tick)) ? formatNumber(ctx.tick) : (ctx.log ? "": formatNumber(ctx.tick)) + "")) {
+    				set_data_dev(t0, t0_value);
+    			}
 
-    			if (dirty[0] & /*yScale*/ 1024 && g_class_value !== (g_class_value = "tick tick-" + /*tick*/ ctx[54] + " svelte-1hzt5y0")) {
+    			if ((changed.yScale) && t1_value !== (t1_value = (ctx.tick == ctx.yScale.ticks(5)[0]) ? " ": "" + "")) {
+    				set_data_dev(t1, t1_value);
+    			}
+
+    			if ((changed.yScale) && g_class_value !== (g_class_value = "tick tick-" + ctx.tick + " svelte-1hzt5y0")) {
     				attr_dev(g, "class", g_class_value);
     			}
 
-    			if (dirty[0] & /*yScale*/ 1024 && g_transform_value !== (g_transform_value = "translate(0, " + (/*yScale*/ ctx[10](/*tick*/ ctx[54]) - /*padding*/ ctx[15].bottom) + ")")) {
+    			if ((changed.yScale) && g_transform_value !== (g_transform_value = "translate(0, " + (ctx.yScale(ctx.tick) - ctx.padding.bottom) + ")")) {
     				attr_dev(g, "transform", g_transform_value);
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(g);
+    			if (detaching) {
+    				detach_dev(g);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block_4.name,
-    		type: "each",
-    		source: "(189:6) {#each yScale.ticks(5) as tick}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_4.name, type: "each", source: "(189:6) {#each yScale.ticks(5) as tick}", ctx });
     	return block;
     }
 
     // (199:6) {#each xScaleTime.ticks() as i}
     function create_each_block_3(ctx) {
-    	let g;
-    	let text_1;
-    	let t0_value = (/*i*/ ctx[44] == 0 ? "Day " : "") + "";
-    	let t0;
-    	let t1_value = /*i*/ ctx[44] + "";
-    	let t1;
-    	let g_transform_value;
+    	var g, text_1, t0_value = ctx.i == 0 ? "Dia ":"" + "", t0, t1_value = ctx.i + "", t1, g_transform_value;
 
     	const block = {
     		c: function create() {
@@ -3181,281 +3108,259 @@
     			attr_dev(text_1, "class", "svelte-1hzt5y0");
     			add_location(text_1, file, 200, 10, 4384);
     			attr_dev(g, "class", "tick svelte-1hzt5y0");
-    			attr_dev(g, "transform", g_transform_value = "translate(" + /*xScaleTime*/ ctx[8](/*i*/ ctx[44]) + "," + /*height*/ ctx[17] + ")");
+    			attr_dev(g, "transform", g_transform_value = "translate(" + ctx.xScaleTime(ctx.i) + "," + height + ")");
     			add_location(g, file, 199, 8, 4309);
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, g, anchor);
     			append_dev(g, text_1);
     			append_dev(text_1, t0);
     			append_dev(text_1, t1);
     		},
-    		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*xScaleTime*/ 256 && t0_value !== (t0_value = (/*i*/ ctx[44] == 0 ? "Day " : "") + "")) set_data_dev(t0, t0_value);
-    			if (dirty[0] & /*xScaleTime*/ 256 && t1_value !== (t1_value = /*i*/ ctx[44] + "")) set_data_dev(t1, t1_value);
 
-    			if (dirty[0] & /*xScaleTime*/ 256 && g_transform_value !== (g_transform_value = "translate(" + /*xScaleTime*/ ctx[8](/*i*/ ctx[44]) + "," + /*height*/ ctx[17] + ")")) {
+    		p: function update(changed, ctx) {
+    			if ((changed.xScaleTime) && t0_value !== (t0_value = ctx.i == 0 ? "Dia ":"" + "")) {
+    				set_data_dev(t0, t0_value);
+    			}
+
+    			if ((changed.xScaleTime) && t1_value !== (t1_value = ctx.i + "")) {
+    				set_data_dev(t1, t1_value);
+    			}
+
+    			if ((changed.xScaleTime) && g_transform_value !== (g_transform_value = "translate(" + ctx.xScaleTime(ctx.i) + "," + height + ")")) {
     				attr_dev(g, "transform", g_transform_value);
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(g);
+    			if (detaching) {
+    				detach_dev(g);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block_3.name,
-    		type: "each",
-    		source: "(199:6) {#each xScaleTime.ticks() as i}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_3.name, type: "each", source: "(199:6) {#each xScaleTime.ticks() as i}", ctx });
     	return block;
     }
 
     // (234:10) {:else}
     function create_else_block(ctx) {
-    	let rect;
-    	let rect_x_value;
-    	let rect_y_value;
-    	let rect_height_value;
-    	let dispose;
+    	var rect, rect_x_value, rect_y_value, rect_height_value, dispose;
 
-    	function func(...args) {
-    		return /*func*/ ctx[39](/*i*/ ctx[44], /*j*/ ctx[49], ...args);
+    	function mouseover_handler_2() {
+    		return ctx.mouseover_handler_2(ctx);
     	}
 
-    	function func_1(...args) {
-    		return /*func_1*/ ctx[40](/*i*/ ctx[44], /*j*/ ctx[49], ...args);
+    	function click_handler_2() {
+    		return ctx.click_handler_2(ctx);
     	}
 
-    	function mouseover_handler_2(...args) {
-    		return /*mouseover_handler_2*/ ctx[41](/*i*/ ctx[44], ...args);
+    	function func() {
+    		return ctx.func(ctx);
     	}
 
-    	function click_handler_2(...args) {
-    		return /*click_handler_2*/ ctx[43](/*i*/ ctx[44], ...args);
+    	function func_1() {
+    		return ctx.func_1(ctx);
     	}
 
     	const block = {
     		c: function create() {
     			rect = svg_element("rect");
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2);
-    			attr_dev(rect, "y", rect_y_value = func());
-    			attr_dev(rect, "width", /*barWidth*/ ctx[12]);
-    			attr_dev(rect, "height", rect_height_value = func_1());
-    			set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
-    			set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
+    			attr_dev(rect, "x", rect_x_value = ctx.xScale(ctx.i) + 2);
+    			attr_dev(rect, "y", rect_y_value = (func)());
+    			attr_dev(rect, "width", ctx.barWidth);
+    			attr_dev(rect, "height", rect_height_value = (func_1)());
+    			set_style(rect, "fill", ctx.colors[ctx.j]);
+    			set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
     			add_location(rect, file, 234, 14, 5564);
-    		},
-    		m: function mount(target, anchor, remount) {
-    			insert_dev(target, rect, anchor);
-    			if (remount) run_all(dispose);
 
     			dispose = [
-    				listen_dev(rect, "mouseover", mouseover_handler_2, false, false, false),
-    				listen_dev(rect, "mouseout", /*mouseout_handler_2*/ ctx[42], false, false, false),
-    				listen_dev(rect, "click", click_handler_2, false, false, false)
+    				listen_dev(rect, "mouseover", mouseover_handler_2),
+    				listen_dev(rect, "mouseout", ctx.mouseout_handler_2),
+    				listen_dev(rect, "click", click_handler_2)
     			];
     		},
-    		p: function update(new_ctx, dirty) {
-    			ctx = new_ctx;
 
-    			if (dirty[0] & /*xScale, y*/ 130 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2)) {
+    		m: function mount(target, anchor) {
+    			insert_dev(target, rect, anchor);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if ((changed.xScale || changed.y) && rect_x_value !== (rect_x_value = ctx.xScale(ctx.i) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if (dirty[0] & /*yScale, y, colors, checked*/ 1046 && rect_y_value !== (rect_y_value = func())) {
+    			if ((changed.yScale || changed.y || changed.colors || changed.checked) && rect_y_value !== (rect_y_value = (func)())) {
     				attr_dev(rect, "y", rect_y_value);
     			}
 
-    			if (dirty[0] & /*barWidth*/ 4096) {
-    				attr_dev(rect, "width", /*barWidth*/ ctx[12]);
+    			if (changed.barWidth) {
+    				attr_dev(rect, "width", ctx.barWidth);
     			}
 
-    			if (dirty[0] & /*yScaleL, y, colors, checked, yScale*/ 3094 && rect_height_value !== (rect_height_value = func_1())) {
+    			if ((changed.yScaleL || changed.y || changed.colors || changed.checked || changed.yScale) && rect_height_value !== (rect_height_value = (func_1)())) {
     				attr_dev(rect, "height", rect_height_value);
     			}
 
-    			if (dirty[0] & /*colors*/ 4) {
-    				set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
+    			if (changed.colors) {
+    				set_style(rect, "fill", ctx.colors[ctx.j]);
     			}
 
-    			if (dirty[0] & /*active, y*/ 3) {
-    				set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
+    			if (changed.active || changed.y) {
+    				set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(rect);
+    			if (detaching) {
+    				detach_dev(rect);
+    			}
+
     			run_all(dispose);
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_else_block.name,
-    		type: "else",
-    		source: "(234:10) {:else}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block.name, type: "else", source: "(234:10) {:else}", ctx });
     	return block;
     }
 
     // (221:10) {#if !log}
     function create_if_block_1(ctx) {
-    	let rect;
-    	let rect_x_value;
-    	let rect_y_value;
-    	let rect_height_value;
-    	let dispose;
+    	var rect, rect_x_value, rect_y_value, rect_height_value, dispose;
 
-    	function mouseover_handler_1(...args) {
-    		return /*mouseover_handler_1*/ ctx[36](/*i*/ ctx[44], ...args);
+    	function mouseover_handler_1() {
+    		return ctx.mouseover_handler_1(ctx);
     	}
 
-    	function click_handler_1(...args) {
-    		return /*click_handler_1*/ ctx[38](/*i*/ ctx[44], ...args);
+    	function click_handler_1() {
+    		return ctx.click_handler_1(ctx);
     	}
 
     	const block = {
     		c: function create() {
     			rect = svg_element("rect");
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2);
-    			attr_dev(rect, "y", rect_y_value = /*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*i*/ ctx[44]].slice(0, /*j*/ ctx[49] + 1), /*checked*/ ctx[4])));
-    			attr_dev(rect, "width", /*barWidth*/ ctx[12]);
-    			attr_dev(rect, "height", rect_height_value = Math.max(/*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*y*/ ctx[1][/*i*/ ctx[44]][/*j*/ ctx[49]] * /*checked*/ ctx[4][/*j*/ ctx[49]]), 0));
-    			set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
-    			set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
+    			attr_dev(rect, "x", rect_x_value = ctx.xScale(ctx.i) + 2);
+    			attr_dev(rect, "y", rect_y_value = ctx.yScale( ctx.sum(ctx.y[ctx.i].slice(0,ctx.j+1), ctx.checked) ));
+    			attr_dev(rect, "width", ctx.barWidth);
+    			attr_dev(rect, "height", rect_height_value = ctx.Math.max(height - ctx.padding.bottom - ctx.yScale(ctx.y[ctx.i][ctx.j]*ctx.checked[ctx.j] ),0));
+    			set_style(rect, "fill", ctx.colors[ctx.j]);
+    			set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
     			add_location(rect, file, 221, 14, 4968);
-    		},
-    		m: function mount(target, anchor, remount) {
-    			insert_dev(target, rect, anchor);
-    			if (remount) run_all(dispose);
 
     			dispose = [
-    				listen_dev(rect, "mouseover", mouseover_handler_1, false, false, false),
-    				listen_dev(rect, "mouseout", /*mouseout_handler_1*/ ctx[37], false, false, false),
-    				listen_dev(rect, "click", click_handler_1, false, false, false)
+    				listen_dev(rect, "mouseover", mouseover_handler_1),
+    				listen_dev(rect, "mouseout", ctx.mouseout_handler_1),
+    				listen_dev(rect, "click", click_handler_1)
     			];
     		},
-    		p: function update(new_ctx, dirty) {
-    			ctx = new_ctx;
 
-    			if (dirty[0] & /*xScale, y*/ 130 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2)) {
+    		m: function mount(target, anchor) {
+    			insert_dev(target, rect, anchor);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if ((changed.xScale || changed.y) && rect_x_value !== (rect_x_value = ctx.xScale(ctx.i) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if (dirty[0] & /*yScale, y, colors, checked*/ 1046 && rect_y_value !== (rect_y_value = /*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*i*/ ctx[44]].slice(0, /*j*/ ctx[49] + 1), /*checked*/ ctx[4])))) {
+    			if ((changed.yScale || changed.y || changed.colors || changed.checked) && rect_y_value !== (rect_y_value = ctx.yScale( ctx.sum(ctx.y[ctx.i].slice(0,ctx.j+1), ctx.checked) ))) {
     				attr_dev(rect, "y", rect_y_value);
     			}
 
-    			if (dirty[0] & /*barWidth*/ 4096) {
-    				attr_dev(rect, "width", /*barWidth*/ ctx[12]);
+    			if (changed.barWidth) {
+    				attr_dev(rect, "width", ctx.barWidth);
     			}
 
-    			if (dirty[0] & /*yScale, y, colors, checked*/ 1046 && rect_height_value !== (rect_height_value = Math.max(/*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*y*/ ctx[1][/*i*/ ctx[44]][/*j*/ ctx[49]] * /*checked*/ ctx[4][/*j*/ ctx[49]]), 0))) {
+    			if ((changed.yScale || changed.y || changed.colors || changed.checked) && rect_height_value !== (rect_height_value = ctx.Math.max(height - ctx.padding.bottom - ctx.yScale(ctx.y[ctx.i][ctx.j]*ctx.checked[ctx.j] ),0))) {
     				attr_dev(rect, "height", rect_height_value);
     			}
 
-    			if (dirty[0] & /*colors*/ 4) {
-    				set_style(rect, "fill", /*colors*/ ctx[2][/*j*/ ctx[49]]);
+    			if (changed.colors) {
+    				set_style(rect, "fill", ctx.colors[ctx.j]);
     			}
 
-    			if (dirty[0] & /*active, y*/ 3) {
-    				set_style(rect, "opacity", /*active*/ ctx[0] == /*i*/ ctx[44] ? 0.9 : 0.6);
+    			if (changed.active || changed.y) {
+    				set_style(rect, "opacity", (ctx.active == ctx.i ? 0.9: 0.6));
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(rect);
+    			if (detaching) {
+    				detach_dev(rect);
+    			}
+
     			run_all(dispose);
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_if_block_1.name,
-    		type: "if",
-    		source: "(221:10) {#if !log}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1.name, type: "if", source: "(221:10) {#if !log}", ctx });
     	return block;
     }
 
     // (220:8) {#each range(colors.length) as j}
     function create_each_block_2(ctx) {
-    	let if_block_anchor;
+    	var if_block_anchor;
 
-    	function select_block_type(ctx, dirty) {
-    		if (!/*log*/ ctx[3]) return create_if_block_1;
+    	function select_block_type(changed, ctx) {
+    		if (!ctx.log) return create_if_block_1;
     		return create_else_block;
     	}
 
-    	let current_block_type = select_block_type(ctx);
-    	let if_block = current_block_type(ctx);
+    	var current_block_type = select_block_type(null, ctx);
+    	var if_block = current_block_type(ctx);
 
     	const block = {
     		c: function create() {
     			if_block.c();
     			if_block_anchor = empty();
     		},
+
     		m: function mount(target, anchor) {
     			if_block.m(target, anchor);
     			insert_dev(target, if_block_anchor, anchor);
     		},
-    		p: function update(ctx, dirty) {
-    			if (current_block_type === (current_block_type = select_block_type(ctx)) && if_block) {
-    				if_block.p(ctx, dirty);
+
+    		p: function update(changed, ctx) {
+    			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block) {
+    				if_block.p(changed, ctx);
     			} else {
     				if_block.d(1);
     				if_block = current_block_type(ctx);
-
     				if (if_block) {
     					if_block.c();
     					if_block.m(if_block_anchor.parentNode, if_block_anchor);
     				}
     			}
     		},
+
     		d: function destroy(detaching) {
     			if_block.d(detaching);
-    			if (detaching) detach_dev(if_block_anchor);
+
+    			if (detaching) {
+    				detach_dev(if_block_anchor);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block_2.name,
-    		type: "each",
-    		source: "(220:8) {#each range(colors.length) as j}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_2.name, type: "each", source: "(220:8) {#each range(colors.length) as j}", ctx });
     	return block;
     }
 
     // (207:6) {#each range(y.length) as i}
     function create_each_block_1(ctx) {
-    	let rect;
-    	let rect_x_value;
-    	let rect_y_value;
-    	let rect_width_value;
-    	let each_1_anchor;
-    	let dispose;
+    	var rect, rect_x_value, rect_width_value, each_1_anchor, dispose;
 
-    	function mouseover_handler(...args) {
-    		return /*mouseover_handler*/ ctx[33](/*i*/ ctx[44], ...args);
+    	function mouseover_handler() {
+    		return ctx.mouseover_handler(ctx);
     	}
 
-    	function click_handler(...args) {
-    		return /*click_handler*/ ctx[35](/*i*/ ctx[44], ...args);
+    	function click_handler() {
+    		return ctx.click_handler(ctx);
     	}
 
-    	let each_value_2 = range(/*colors*/ ctx[2].length);
-    	validate_each_argument(each_value_2);
+    	let each_value_2 = range(ctx.colors.length);
+
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value_2.length; i += 1) {
@@ -3472,15 +3377,22 @@
 
     			each_1_anchor = empty();
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2);
-    			attr_dev(rect, "y", rect_y_value = 0);
-    			attr_dev(rect, "width", rect_width_value = /*barWidth*/ ctx[12] + 3);
-    			attr_dev(rect, "height", /*height*/ ctx[17]);
+    			attr_dev(rect, "x", rect_x_value = ctx.xScale(ctx.i) + 2);
+    			attr_dev(rect, "y", 0);
+    			attr_dev(rect, "width", rect_width_value = ctx.barWidth+3);
+    			attr_dev(rect, "height", height);
     			set_style(rect, "fill", "white");
     			set_style(rect, "opacity", "0");
     			add_location(rect, file, 207, 8, 4535);
+
+    			dispose = [
+    				listen_dev(rect, "mouseover", mouseover_handler),
+    				listen_dev(rect, "mouseout", ctx.mouseout_handler),
+    				listen_dev(rect, "click", click_handler)
+    			];
     		},
-    		m: function mount(target, anchor, remount) {
+
+    		m: function mount(target, anchor) {
     			insert_dev(target, rect, anchor);
 
     			for (let i = 0; i < each_blocks.length; i += 1) {
@@ -3488,35 +3400,27 @@
     			}
 
     			insert_dev(target, each_1_anchor, anchor);
-    			if (remount) run_all(dispose);
-
-    			dispose = [
-    				listen_dev(rect, "mouseover", mouseover_handler, false, false, false),
-    				listen_dev(rect, "mouseout", /*mouseout_handler*/ ctx[34], false, false, false),
-    				listen_dev(rect, "click", click_handler, false, false, false)
-    			];
     		},
-    		p: function update(new_ctx, dirty) {
-    			ctx = new_ctx;
 
-    			if (dirty[0] & /*xScale, y*/ 130 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44]) + 2)) {
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if ((changed.xScale || changed.y) && rect_x_value !== (rect_x_value = ctx.xScale(ctx.i) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if (dirty[0] & /*barWidth*/ 4096 && rect_width_value !== (rect_width_value = /*barWidth*/ ctx[12] + 3)) {
+    			if ((changed.barWidth) && rect_width_value !== (rect_width_value = ctx.barWidth+3)) {
     				attr_dev(rect, "width", rect_width_value);
     			}
 
-    			if (dirty[0] & /*xScale, y, yScale, sum, colors, checked, barWidth, height, padding, active, showTip, lock, active_lock, indexToTime, log, yScaleL*/ 196351) {
-    				each_value_2 = range(/*colors*/ ctx[2].length);
-    				validate_each_argument(each_value_2);
-    				let i;
+    			if (changed.log || changed.xScale || changed.range || changed.y || changed.yScale || changed.sum || changed.colors || changed.checked || changed.barWidth || changed.Math || changed.height || changed.padding || changed.active || changed.yScaleL) {
+    				each_value_2 = range(ctx.colors.length);
 
+    				let i;
     				for (i = 0; i < each_value_2.length; i += 1) {
     					const child_ctx = get_each_context_2(ctx, each_value_2, i);
 
     					if (each_blocks[i]) {
-    						each_blocks[i].p(child_ctx, dirty);
+    						each_blocks[i].p(changed, child_ctx);
     					} else {
     						each_blocks[i] = create_each_block_2(child_ctx);
     						each_blocks[i].c();
@@ -3527,91 +3431,81 @@
     				for (; i < each_blocks.length; i += 1) {
     					each_blocks[i].d(1);
     				}
-
     				each_blocks.length = each_value_2.length;
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(rect);
+    			if (detaching) {
+    				detach_dev(rect);
+    			}
+
     			destroy_each(each_blocks, detaching);
-    			if (detaching) detach_dev(each_1_anchor);
+
+    			if (detaching) {
+    				detach_dev(each_1_anchor);
+    			}
+
     			run_all(dispose);
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block_1.name,
-    		type: "each",
-    		source: "(207:6) {#each range(y.length) as i}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_1.name, type: "each", source: "(207:6) {#each range(y.length) as i}", ctx });
     	return block;
     }
 
     // (268:6) {#each range(data.length) as i}
     function create_each_block(ctx) {
-    	let rect;
-    	let rect_x_value;
-    	let rect_y_value;
-    	let rect_height_value;
+    	var rect, rect_x_value, rect_y_value, rect_height_value;
 
     	const block = {
     		c: function create() {
     			rect = svg_element("rect");
     			attr_dev(rect, "class", "bar svelte-1hzt5y0");
-    			attr_dev(rect, "x", rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44] + 28) + 2);
-    			attr_dev(rect, "y", rect_y_value = /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]));
-    			attr_dev(rect, "width", /*barWidth*/ ctx[12]);
-    			attr_dev(rect, "height", rect_height_value = /*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]));
+    			attr_dev(rect, "x", rect_x_value = ctx.xScale( ctx.i+28 ) + 2);
+    			attr_dev(rect, "y", rect_y_value = ctx.yScale( ctx.data[ctx.i][1] ));
+    			attr_dev(rect, "width", ctx.barWidth);
+    			attr_dev(rect, "height", rect_height_value = height - ctx.padding.bottom - ctx.yScale( ctx.data[ctx.i][1] ));
     			set_style(rect, "fill", "black");
     			set_style(rect, "opacity", "0.5");
     			set_style(rect, "box-shadow", "4px 10px 5px 2px rgba(0,0,0,0.75)");
     			add_location(rect, file, 268, 8, 6892);
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, rect, anchor);
     		},
-    		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*xScale*/ 128 && rect_x_value !== (rect_x_value = /*xScale*/ ctx[7](/*i*/ ctx[44] + 28) + 2)) {
+
+    		p: function update(changed, ctx) {
+    			if ((changed.xScale) && rect_x_value !== (rect_x_value = ctx.xScale( ctx.i+28 ) + 2)) {
     				attr_dev(rect, "x", rect_x_value);
     			}
 
-    			if (dirty[0] & /*yScale*/ 1024 && rect_y_value !== (rect_y_value = /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]))) {
+    			if ((changed.yScale) && rect_y_value !== (rect_y_value = ctx.yScale( ctx.data[ctx.i][1] ))) {
     				attr_dev(rect, "y", rect_y_value);
     			}
 
-    			if (dirty[0] & /*barWidth*/ 4096) {
-    				attr_dev(rect, "width", /*barWidth*/ ctx[12]);
+    			if (changed.barWidth) {
+    				attr_dev(rect, "width", ctx.barWidth);
     			}
 
-    			if (dirty[0] & /*yScale*/ 1024 && rect_height_value !== (rect_height_value = /*height*/ ctx[17] - /*padding*/ ctx[15].bottom - /*yScale*/ ctx[10](/*data*/ ctx[18][/*i*/ ctx[44]][1]))) {
+    			if ((changed.yScale) && rect_height_value !== (rect_height_value = height - ctx.padding.bottom - ctx.yScale( ctx.data[ctx.i][1] ))) {
     				attr_dev(rect, "height", rect_height_value);
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(rect);
+    			if (detaching) {
+    				detach_dev(rect);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block.name,
-    		type: "each",
-    		source: "(268:6) {#each range(data.length) as i}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block.name, type: "each", source: "(268:6) {#each range(data.length) as i}", ctx });
     	return block;
     }
 
     // (286:4) {#if active >= 0}
     function create_if_block(ctx) {
-    	let div;
-    	let svg;
-    	let path;
-    	let path_fill_value;
+    	var div, svg, path, path_fill_value;
 
     	const block = {
     		c: function create() {
@@ -3619,7 +3513,7 @@
     			svg = svg_element("svg");
     			path = svg_element("path");
     			attr_dev(path, "d", "M 0 0 L 10 0 L 5 10 z");
-    			attr_dev(path, "fill", path_fill_value = /*lock*/ ctx[13] ? "#555" : "#AAA");
+    			attr_dev(path, "fill", path_fill_value = ctx.lock ? '#555':'#AAA');
     			attr_dev(path, "stroke-width", "3");
     			add_location(path, file, 293, 10, 7898);
     			set_style(svg, "position", "absolute");
@@ -3632,88 +3526,78 @@
     			set_style(div, "position", "absolute");
     			set_style(div, "pointer-events", "none");
     			set_style(div, "width", "100px");
-    			set_style(div, "left", /*xScale*/ ctx[7](/*active*/ ctx[0]) + "px");
-    			set_style(div, "top", Math.max(/*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*active*/ ctx[0]], /*checked*/ ctx[4])), 0) + "px");
+    			set_style(div, "left", "" + ctx.xScale(ctx.active) + "px");
+    			set_style(div, "top", "" + ctx.Math.max(ctx.yScale(ctx.sum(ctx.y[ctx.active], ctx.checked)),0) + "px");
     			attr_dev(div, "class", "tip");
     			add_location(div, file, 286, 6, 7440);
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, div, anchor);
     			append_dev(div, svg);
     			append_dev(svg, path);
     		},
-    		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*lock*/ 8192 && path_fill_value !== (path_fill_value = /*lock*/ ctx[13] ? "#555" : "#AAA")) {
+
+    		p: function update(changed, ctx) {
+    			if ((changed.lock) && path_fill_value !== (path_fill_value = ctx.lock ? '#555':'#AAA')) {
     				attr_dev(path, "fill", path_fill_value);
     			}
 
-    			if (dirty[0] & /*xScale, active*/ 129) {
-    				set_style(div, "left", /*xScale*/ ctx[7](/*active*/ ctx[0]) + "px");
+    			if (changed.xScale || changed.active) {
+    				set_style(div, "left", "" + ctx.xScale(ctx.active) + "px");
     			}
 
-    			if (dirty[0] & /*yScale, y, active, checked*/ 1043) {
-    				set_style(div, "top", Math.max(/*yScale*/ ctx[10](/*sum*/ ctx[14](/*y*/ ctx[1][/*active*/ ctx[0]], /*checked*/ ctx[4])), 0) + "px");
+    			if (changed.yScale || changed.y || changed.active || changed.checked) {
+    				set_style(div, "top", "" + ctx.Math.max(ctx.yScale(ctx.sum(ctx.y[ctx.active], ctx.checked)),0) + "px");
     			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div);
+    			if (detaching) {
+    				detach_dev(div);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_if_block.name,
-    		type: "if",
-    		source: "(286:4) {#if active >= 0}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block.name, type: "if", source: "(286:4) {#if active >= 0}", ctx });
     	return block;
     }
 
     function create_fragment(ctx) {
-    	let div1;
-    	let svg;
-    	let g0;
-    	let g0_transform_value;
-    	let g1;
-    	let g2;
-    	let g3;
-    	let t;
-    	let div0;
-    	let each_value_4 = /*yScale*/ ctx[10].ticks(5);
-    	validate_each_argument(each_value_4);
+    	var div1, svg, g0, g1, g2, g3, t, div0;
+
+    	let each_value_4 = ctx.yScale.ticks(5);
+
     	let each_blocks_3 = [];
 
     	for (let i = 0; i < each_value_4.length; i += 1) {
     		each_blocks_3[i] = create_each_block_4(get_each_context_4(ctx, each_value_4, i));
     	}
 
-    	let each_value_3 = /*xScaleTime*/ ctx[8].ticks();
-    	validate_each_argument(each_value_3);
+    	let each_value_3 = ctx.xScaleTime.ticks();
+
     	let each_blocks_2 = [];
 
     	for (let i = 0; i < each_value_3.length; i += 1) {
     		each_blocks_2[i] = create_each_block_3(get_each_context_3(ctx, each_value_3, i));
     	}
 
-    	let each_value_1 = range(/*y*/ ctx[1].length);
-    	validate_each_argument(each_value_1);
+    	let each_value_1 = range(ctx.y.length);
+
     	let each_blocks_1 = [];
 
     	for (let i = 0; i < each_value_1.length; i += 1) {
     		each_blocks_1[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
     	}
 
-    	let each_value = range(/*data*/ ctx[18].length);
-    	validate_each_argument(each_value);
+    	let each_value = range(ctx.data.length);
+
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
     		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
     	}
 
-    	let if_block = /*active*/ ctx[0] >= 0 && create_if_block(ctx);
+    	var if_block = (ctx.active >= 0) && create_if_block(ctx);
 
     	const block = {
     		c: function create() {
@@ -3747,7 +3631,7 @@
     			div0 = element("div");
     			if (if_block) if_block.c();
     			attr_dev(g0, "class", "axis y-axis");
-    			attr_dev(g0, "transform", g0_transform_value = "translate(0," + /*padding*/ ctx[15].top + ")");
+    			attr_dev(g0, "transform", "translate(0," + ctx.padding.top + ")");
     			add_location(g0, file, 187, 4, 3786);
     			attr_dev(g1, "class", "axis x-axis svelte-1hzt5y0");
     			add_location(g1, file, 197, 4, 4239);
@@ -3756,26 +3640,28 @@
     			attr_dev(g3, "class", "bars");
     			add_location(g3, file, 266, 4, 6829);
     			set_style(svg, "position", "absolute");
-    			set_style(svg, "height", /*height*/ ctx[17] + "px");
+    			set_style(svg, "height", "" + height + "px");
     			attr_dev(svg, "class", "svelte-1hzt5y0");
     			add_location(svg, file, 184, 2, 3709);
     			set_style(div0, "position", "absolute");
-    			set_style(div0, "width", /*width*/ ctx[16] + 15 + "px");
-    			set_style(div0, "height", /*height*/ ctx[17] + "px");
+    			set_style(div0, "width", "" + (width+15) + "px");
+    			set_style(div0, "height", "" + height + "px");
     			set_style(div0, "position", "absolute");
     			set_style(div0, "top", "0px");
     			set_style(div0, "left", "0px");
     			set_style(div0, "pointer-events", "none");
     			add_location(div0, file, 283, 2, 7274);
-    			set_style(div1, "width", /*width*/ ctx[16] + 15 + "px");
-    			set_style(div1, "height", /*height*/ ctx[17] + "px");
+    			set_style(div1, "width", "" + (width+15) + "px");
+    			set_style(div1, "height", "" + height + "px");
     			set_style(div1, "position", "relative");
     			set_style(div1, "top", "20px");
     			add_location(div1, file, 183, 0, 3624);
     		},
+
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, div1, anchor);
     			append_dev(div1, svg);
@@ -3807,17 +3693,17 @@
     			append_dev(div1, div0);
     			if (if_block) if_block.m(div0, null);
     		},
-    		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*yScale, padding, log*/ 33800) {
-    				each_value_4 = /*yScale*/ ctx[10].ticks(5);
-    				validate_each_argument(each_value_4);
-    				let i;
 
+    		p: function update(changed, ctx) {
+    			if (changed.yScale || changed.padding || changed.Math || changed.formatNumber || changed.log) {
+    				each_value_4 = ctx.yScale.ticks(5);
+
+    				let i;
     				for (i = 0; i < each_value_4.length; i += 1) {
     					const child_ctx = get_each_context_4(ctx, each_value_4, i);
 
     					if (each_blocks_3[i]) {
-    						each_blocks_3[i].p(child_ctx, dirty);
+    						each_blocks_3[i].p(changed, child_ctx);
     					} else {
     						each_blocks_3[i] = create_each_block_4(child_ctx);
     						each_blocks_3[i].c();
@@ -3828,20 +3714,18 @@
     				for (; i < each_blocks_3.length; i += 1) {
     					each_blocks_3[i].d(1);
     				}
-
     				each_blocks_3.length = each_value_4.length;
     			}
 
-    			if (dirty[0] & /*xScaleTime, height*/ 131328) {
-    				each_value_3 = /*xScaleTime*/ ctx[8].ticks();
-    				validate_each_argument(each_value_3);
-    				let i;
+    			if (changed.xScaleTime || changed.height) {
+    				each_value_3 = ctx.xScaleTime.ticks();
 
+    				let i;
     				for (i = 0; i < each_value_3.length; i += 1) {
     					const child_ctx = get_each_context_3(ctx, each_value_3, i);
 
     					if (each_blocks_2[i]) {
-    						each_blocks_2[i].p(child_ctx, dirty);
+    						each_blocks_2[i].p(changed, child_ctx);
     					} else {
     						each_blocks_2[i] = create_each_block_3(child_ctx);
     						each_blocks_2[i].c();
@@ -3852,20 +3736,18 @@
     				for (; i < each_blocks_2.length; i += 1) {
     					each_blocks_2[i].d(1);
     				}
-
     				each_blocks_2.length = each_value_3.length;
     			}
 
-    			if (dirty[0] & /*colors, xScale, y, yScale, sum, checked, barWidth, height, padding, active, showTip, lock, active_lock, indexToTime, log, yScaleL*/ 196351) {
-    				each_value_1 = range(/*y*/ ctx[1].length);
-    				validate_each_argument(each_value_1);
-    				let i;
+    			if (changed.range || changed.colors || changed.log || changed.xScale || changed.y || changed.yScale || changed.sum || changed.checked || changed.barWidth || changed.Math || changed.height || changed.padding || changed.active || changed.yScaleL) {
+    				each_value_1 = range(ctx.y.length);
 
+    				let i;
     				for (i = 0; i < each_value_1.length; i += 1) {
     					const child_ctx = get_each_context_1(ctx, each_value_1, i);
 
     					if (each_blocks_1[i]) {
-    						each_blocks_1[i].p(child_ctx, dirty);
+    						each_blocks_1[i].p(changed, child_ctx);
     					} else {
     						each_blocks_1[i] = create_each_block_1(child_ctx);
     						each_blocks_1[i].c();
@@ -3876,20 +3758,18 @@
     				for (; i < each_blocks_1.length; i += 1) {
     					each_blocks_1[i].d(1);
     				}
-
     				each_blocks_1.length = each_value_1.length;
     			}
 
-    			if (dirty[0] & /*xScale, data, yScale, barWidth, height, padding*/ 431232) {
-    				each_value = range(/*data*/ ctx[18].length);
-    				validate_each_argument(each_value);
-    				let i;
+    			if (changed.xScale || changed.range || changed.data || changed.yScale || changed.barWidth || changed.height || changed.padding) {
+    				each_value = range(ctx.data.length);
 
+    				let i;
     				for (i = 0; i < each_value.length; i += 1) {
     					const child_ctx = get_each_context(ctx, each_value, i);
 
     					if (each_blocks[i]) {
-    						each_blocks[i].p(child_ctx, dirty);
+    						each_blocks[i].p(changed, child_ctx);
     					} else {
     						each_blocks[i] = create_each_block(child_ctx);
     						each_blocks[i].c();
@@ -3900,13 +3780,12 @@
     				for (; i < each_blocks.length; i += 1) {
     					each_blocks[i].d(1);
     				}
-
     				each_blocks.length = each_value.length;
     			}
 
-    			if (/*active*/ ctx[0] >= 0) {
+    			if (ctx.active >= 0) {
     				if (if_block) {
-    					if_block.p(ctx, dirty);
+    					if_block.p(changed, ctx);
     				} else {
     					if_block = create_if_block(ctx);
     					if_block.c();
@@ -3917,166 +3796,200 @@
     				if_block = null;
     			}
     		},
+
     		i: noop,
     		o: noop,
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div1);
+    			if (detaching) {
+    				detach_dev(div1);
+    			}
+
     			destroy_each(each_blocks_3, detaching);
+
     			destroy_each(each_blocks_2, detaching);
+
     			destroy_each(each_blocks_1, detaching);
+
     			destroy_each(each_blocks, detaching);
+
     			if (if_block) if_block.d();
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment.name, type: "component", source: "", ctx });
     	return block;
     }
 
-    function range(n) {
-    	return Array(n).fill().map((_, i) => i);
+    let width  = 750;
+
+    let height = 420;
+
+    function range(n){
+      return Array(n).fill().map((_, i) => i);
     }
 
     function formatNumber(num) {
-    	return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, "$1,");
+      return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,')
     }
 
     function instance($$self, $$props, $$invalidate) {
-    	const dispatch = createEventDispatcher();
 
-    	var sum = function (arr, bools) {
-    		var x = 0;
+      var sum = function(arr, bools){
+        var x = 0;
+        for (var i = 0; i < arr.length; i++) {
+          x = x + arr[i]*(bools[i] ? 1 : 0);
+        }
+        return x
+      };
 
-    		for (var i = 0; i < arr.length; i++) {
-    			x = x + arr[i] * (bools[i] ? 1 : 0);
-    		}
+      let { y, tmax, xmax, deaths, total, vline, timestep, total_infected, N, ymax, InterventionTime, colors, log: log$1 = false } = $$props;
 
-    		return x;
-    	};
+      const padding = { top: 20, right: 0, bottom: 20, left: 25 };
+      var active_lock = 0;
+      let { active, checked } = $$props;
 
-    	let { y } = $$props;
-    	let { tmax } = $$props;
-    	let { xmax } = $$props;
-    	let { deaths } = $$props;
-    	let { total } = $$props;
-    	let { vline } = $$props;
-    	let { timestep } = $$props;
-    	let { total_infected } = $$props;
-    	let { N } = $$props;
-    	let { ymax } = $$props;
-    	let { InterventionTime } = $$props;
-    	let { colors } = $$props;
-    	let { log: log$1 = false } = $$props;
-    	const padding = { top: 20, right: 0, bottom: 20, left: 25 };
-    	let width = 750;
-    	let height = 420;
-    	var active_lock = 0;
-    	let { active } = $$props;
-    	let { checked } = $$props;
+      // var data = [[2   , 2  ], [5   , 2  ], [18  , 4  ], [28  , 6  ], [43  , 8  ], [61  , 12 ], [95  , 16 ], [139 , 19 ], [245 , 26 ], [388 , 34 ], [593 , 43 ], [978 , 54 ], [1501, 66 ], [2336, 77 ], [2922, 92 ], [3513, 107], [4747, 124]]
+      var data = [];
 
-    	// var data = [[2   , 2  ], [5   , 2  ], [18  , 4  ], [28  , 6  ], [43  , 8  ], [61  , 12 ], [95  , 16 ], [139 , 19 ], [245 , 26 ], [388 , 34 ], [593 , 43 ], [978 , 54 ], [1501, 66 ], [2336, 77 ], [2922, 92 ], [3513, 107], [4747, 124]]
-    	var data = [];
-
-    	const writable_props = [
-    		"y",
-    		"tmax",
-    		"xmax",
-    		"deaths",
-    		"total",
-    		"vline",
-    		"timestep",
-    		"total_infected",
-    		"N",
-    		"ymax",
-    		"InterventionTime",
-    		"colors",
-    		"log",
-    		"active",
-    		"checked"
-    	];
-
+    	const writable_props = ['y', 'tmax', 'xmax', 'deaths', 'total', 'vline', 'timestep', 'total_infected', 'N', 'ymax', 'InterventionTime', 'colors', 'log', 'active', 'checked'];
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Chart> was created with unknown prop '${key}'`);
+    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Chart> was created with unknown prop '${key}'`);
     	});
 
-    	let { $$slots = {}, $$scope } = $$props;
-    	validate_slots("Chart", $$slots, []);
-    	const mouseover_handler = i => showTip(i);
+    	const mouseover_handler = ({ i }) => showTip(i);
+
     	const mouseout_handler = () => showTip(-1);
 
-    	const click_handler = i => {
-    		$$invalidate(13, lock = !lock);
-    		$$invalidate(5, active_lock = indexToTime(i));
-    	};
+    	const click_handler = ({ i }) => {$$invalidate('lock', lock = !lock); $$invalidate('active_lock', active_lock = indexToTime(i)); };
 
-    	const mouseover_handler_1 = i => showTip(i);
+    	const mouseover_handler_1 = ({ i }) => showTip(i);
+
     	const mouseout_handler_1 = () => showTip(-1);
 
-    	const click_handler_1 = i => {
-    		$$invalidate(13, lock = !lock);
-    		$$invalidate(5, active_lock = indexToTime(i));
-    	};
+    	const click_handler_1 = ({ i }) => {$$invalidate('lock', lock = !lock); $$invalidate('active_lock', active_lock = indexToTime(i)); };
 
-    	const func = function (i, j) {
-    		var z = yScale(sum(y[i].slice(0, j + 1), checked));
-    		return Math.min(isNaN(z) ? 0 : z, height - padding.top);
-    	};
+    	const mouseover_handler_2 = ({ i }) => showTip(i);
 
-    	const func_1 = function (i, j) {
-    		var top = yScaleL(sum(y[i].slice(0, j + 1), checked) + 0.0001);
-    		var btm = yScaleL(sum(y[i].slice(0, j), checked) + 0.0001);
-    		var z = top - btm;
-
-    		if (z + yScale(sum(y[i].slice(0, j + 1), checked)) > height - padding.top) {
-    			return top;
-    		} else {
-    			return Math.max(isNaN(z) ? 0 : z, 0);
-    		}
-    	};
-
-    	const mouseover_handler_2 = i => showTip(i);
     	const mouseout_handler_2 = () => showTip(-1);
 
-    	const click_handler_2 = i => {
-    		$$invalidate(13, lock = !lock);
-    		$$invalidate(5, active_lock = indexToTime(i));
-    	};
+    	const click_handler_2 = ({ i }) => {$$invalidate('lock', lock = !lock); $$invalidate('active_lock', active_lock = indexToTime(i)); };
+
+    	function func({ i, j }) { 
+    	                        var z = yScale( sum(y[i].slice(0,j+1), checked) ); 
+    	                        return Math.min(isNaN(z) ? 0: z, height - padding.top)
+    	                      }
+
+    	function func_1({ i, j }) {
+    	                  var top = yScaleL( sum(y[i].slice(0,j+1),checked) + 0.0001 );
+    	                  var btm = yScaleL( sum(y[i].slice(0,j),checked) + 0.0001);
+    	                  var z = top - btm; 
+    	                  if (z + yScale( sum(y[i].slice(0,j+1), checked) ) > height - padding.top) {
+    	                    return top
+    	                  } else {
+    	                    return Math.max(isNaN(z) ? 0 : z,0)
+    	                  }}
 
     	$$self.$set = $$props => {
-    		if ("y" in $$props) $$invalidate(1, y = $$props.y);
-    		if ("tmax" in $$props) $$invalidate(19, tmax = $$props.tmax);
-    		if ("xmax" in $$props) $$invalidate(20, xmax = $$props.xmax);
-    		if ("deaths" in $$props) $$invalidate(21, deaths = $$props.deaths);
-    		if ("total" in $$props) $$invalidate(22, total = $$props.total);
-    		if ("vline" in $$props) $$invalidate(23, vline = $$props.vline);
-    		if ("timestep" in $$props) $$invalidate(24, timestep = $$props.timestep);
-    		if ("total_infected" in $$props) $$invalidate(25, total_infected = $$props.total_infected);
-    		if ("N" in $$props) $$invalidate(26, N = $$props.N);
-    		if ("ymax" in $$props) $$invalidate(27, ymax = $$props.ymax);
-    		if ("InterventionTime" in $$props) $$invalidate(28, InterventionTime = $$props.InterventionTime);
-    		if ("colors" in $$props) $$invalidate(2, colors = $$props.colors);
-    		if ("log" in $$props) $$invalidate(3, log$1 = $$props.log);
-    		if ("active" in $$props) $$invalidate(0, active = $$props.active);
-    		if ("checked" in $$props) $$invalidate(4, checked = $$props.checked);
+    		if ('y' in $$props) $$invalidate('y', y = $$props.y);
+    		if ('tmax' in $$props) $$invalidate('tmax', tmax = $$props.tmax);
+    		if ('xmax' in $$props) $$invalidate('xmax', xmax = $$props.xmax);
+    		if ('deaths' in $$props) $$invalidate('deaths', deaths = $$props.deaths);
+    		if ('total' in $$props) $$invalidate('total', total = $$props.total);
+    		if ('vline' in $$props) $$invalidate('vline', vline = $$props.vline);
+    		if ('timestep' in $$props) $$invalidate('timestep', timestep = $$props.timestep);
+    		if ('total_infected' in $$props) $$invalidate('total_infected', total_infected = $$props.total_infected);
+    		if ('N' in $$props) $$invalidate('N', N = $$props.N);
+    		if ('ymax' in $$props) $$invalidate('ymax', ymax = $$props.ymax);
+    		if ('InterventionTime' in $$props) $$invalidate('InterventionTime', InterventionTime = $$props.InterventionTime);
+    		if ('colors' in $$props) $$invalidate('colors', colors = $$props.colors);
+    		if ('log' in $$props) $$invalidate('log', log$1 = $$props.log);
+    		if ('active' in $$props) $$invalidate('active', active = $$props.active);
+    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
     	};
 
-    	$$self.$capture_state = () => ({
-    		scaleLinear: linear$1,
-    		scaleLog: log,
-    		drag,
-    		selectAll,
-    		onMount,
-    		createEventDispatcher,
-    		dispatch,
-    		range,
-    		formatNumber,
+    	$$self.$capture_state = () => {
+    		return { sum, y, tmax, xmax, deaths, total, vline, timestep, total_infected, N, ymax, InterventionTime, colors, log: log$1, width, height, active_lock, active, checked, data, showTip, active_hover, xScale, xScaleTime, indexToTime, timeToIndex, yScale, yScaleL, innerWidth, barWidth, lock };
+    	};
+
+    	$$self.$inject_state = $$props => {
+    		if ('sum' in $$props) $$invalidate('sum', sum = $$props.sum);
+    		if ('y' in $$props) $$invalidate('y', y = $$props.y);
+    		if ('tmax' in $$props) $$invalidate('tmax', tmax = $$props.tmax);
+    		if ('xmax' in $$props) $$invalidate('xmax', xmax = $$props.xmax);
+    		if ('deaths' in $$props) $$invalidate('deaths', deaths = $$props.deaths);
+    		if ('total' in $$props) $$invalidate('total', total = $$props.total);
+    		if ('vline' in $$props) $$invalidate('vline', vline = $$props.vline);
+    		if ('timestep' in $$props) $$invalidate('timestep', timestep = $$props.timestep);
+    		if ('total_infected' in $$props) $$invalidate('total_infected', total_infected = $$props.total_infected);
+    		if ('N' in $$props) $$invalidate('N', N = $$props.N);
+    		if ('ymax' in $$props) $$invalidate('ymax', ymax = $$props.ymax);
+    		if ('InterventionTime' in $$props) $$invalidate('InterventionTime', InterventionTime = $$props.InterventionTime);
+    		if ('colors' in $$props) $$invalidate('colors', colors = $$props.colors);
+    		if ('log' in $$props) $$invalidate('log', log$1 = $$props.log);
+    		if ('width' in $$props) $$invalidate('width', width = $$props.width);
+    		if ('height' in $$props) $$invalidate('height', height = $$props.height);
+    		if ('active_lock' in $$props) $$invalidate('active_lock', active_lock = $$props.active_lock);
+    		if ('active' in $$props) $$invalidate('active', active = $$props.active);
+    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
+    		if ('data' in $$props) $$invalidate('data', data = $$props.data);
+    		if ('showTip' in $$props) $$invalidate('showTip', showTip = $$props.showTip);
+    		if ('active_hover' in $$props) $$invalidate('active_hover', active_hover = $$props.active_hover);
+    		if ('xScale' in $$props) $$invalidate('xScale', xScale = $$props.xScale);
+    		if ('xScaleTime' in $$props) $$invalidate('xScaleTime', xScaleTime = $$props.xScaleTime);
+    		if ('indexToTime' in $$props) $$invalidate('indexToTime', indexToTime = $$props.indexToTime);
+    		if ('timeToIndex' in $$props) $$invalidate('timeToIndex', timeToIndex = $$props.timeToIndex);
+    		if ('yScale' in $$props) $$invalidate('yScale', yScale = $$props.yScale);
+    		if ('yScaleL' in $$props) $$invalidate('yScaleL', yScaleL = $$props.yScaleL);
+    		if ('innerWidth' in $$props) $$invalidate('innerWidth', innerWidth = $$props.innerWidth);
+    		if ('barWidth' in $$props) $$invalidate('barWidth', barWidth = $$props.barWidth);
+    		if ('lock' in $$props) $$invalidate('lock', lock = $$props.lock);
+    	};
+
+    	let showTip, xScale, xScaleTime, indexToTime, timeToIndex, yScale, yScaleL, innerWidth, barWidth, active_hover, lock;
+
+    	$$self.$$.update = ($$dirty = { y: 1, width: 1, tmax: 1, log: 1, ymax: 1, height: 1, innerWidth: 1, lock: 1, timeToIndex: 1, active_lock: 1, active_hover: 1 }) => {
+    		if ($$dirty.y || $$dirty.width) { $$invalidate('xScale', xScale = linear$1()
+            .domain([0, y.length])
+            .range([padding.left, width - padding.right])); }
+    		if ($$dirty.tmax || $$dirty.width) { $$invalidate('xScaleTime', xScaleTime = linear$1()
+            .domain([0, tmax])
+            .range([padding.left, width - padding.right])); }
+    		if ($$dirty.y || $$dirty.tmax) { $$invalidate('indexToTime', indexToTime = linear$1()
+            .domain([0, y.length])
+            .range([0, tmax])); }
+    		if ($$dirty.tmax || $$dirty.y) { $$invalidate('timeToIndex', timeToIndex = linear$1()
+            .domain([0, tmax])
+            .range([0, y.length])); }
+    		if ($$dirty.log || $$dirty.ymax || $$dirty.height) { $$invalidate('yScale', yScale = (log$1 ? log(): linear$1())
+            .domain([log$1 ? 1: 0,  ymax/1])
+            .range([height - padding.bottom, padding.top])); }
+    		if ($$dirty.ymax || $$dirty.height) { $$invalidate('yScaleL', yScaleL = log()
+            .domain([1,  ymax/1])
+            .range([0, height - padding.bottom - padding.top])); }
+    		if ($$dirty.width) { $$invalidate('innerWidth', innerWidth = width - (padding.left + padding.right)); }
+    		if ($$dirty.innerWidth || $$dirty.y) { $$invalidate('barWidth', barWidth = innerWidth / y.length - 1.5); }
+    		if ($$dirty.lock || $$dirty.timeToIndex || $$dirty.active_lock || $$dirty.active_hover) { $$invalidate('active', active = (function () {
+            if (lock){
+              var i = Math.round(timeToIndex(active_lock));
+              if (i > 99) {
+                $$invalidate('lock', lock = false);
+                i = 0;
+              } else {
+                return i
+              }
+            } else {
+              return active_hover
+            }
+          })()); }
+    	};
+
+    	$$invalidate('showTip', showTip = function (i) {
+            $$invalidate('active_hover', active_hover = i);
+          });
+    	$$invalidate('active_hover', active_hover = -1);
+    	$$invalidate('lock', lock = false);
+
+    	return {
     		sum,
     		y,
     		tmax,
@@ -4092,137 +4005,10 @@
     		colors,
     		log: log$1,
     		padding,
-    		width,
-    		height,
     		active_lock,
     		active,
     		checked,
     		data,
-    		showTip,
-    		active_hover,
-    		xScale,
-    		xScaleTime,
-    		indexToTime,
-    		timeToIndex,
-    		yScale,
-    		yScaleL,
-    		innerWidth,
-    		barWidth,
-    		lock
-    	});
-
-    	$$self.$inject_state = $$props => {
-    		if ("sum" in $$props) $$invalidate(14, sum = $$props.sum);
-    		if ("y" in $$props) $$invalidate(1, y = $$props.y);
-    		if ("tmax" in $$props) $$invalidate(19, tmax = $$props.tmax);
-    		if ("xmax" in $$props) $$invalidate(20, xmax = $$props.xmax);
-    		if ("deaths" in $$props) $$invalidate(21, deaths = $$props.deaths);
-    		if ("total" in $$props) $$invalidate(22, total = $$props.total);
-    		if ("vline" in $$props) $$invalidate(23, vline = $$props.vline);
-    		if ("timestep" in $$props) $$invalidate(24, timestep = $$props.timestep);
-    		if ("total_infected" in $$props) $$invalidate(25, total_infected = $$props.total_infected);
-    		if ("N" in $$props) $$invalidate(26, N = $$props.N);
-    		if ("ymax" in $$props) $$invalidate(27, ymax = $$props.ymax);
-    		if ("InterventionTime" in $$props) $$invalidate(28, InterventionTime = $$props.InterventionTime);
-    		if ("colors" in $$props) $$invalidate(2, colors = $$props.colors);
-    		if ("log" in $$props) $$invalidate(3, log$1 = $$props.log);
-    		if ("width" in $$props) $$invalidate(16, width = $$props.width);
-    		if ("height" in $$props) $$invalidate(17, height = $$props.height);
-    		if ("active_lock" in $$props) $$invalidate(5, active_lock = $$props.active_lock);
-    		if ("active" in $$props) $$invalidate(0, active = $$props.active);
-    		if ("checked" in $$props) $$invalidate(4, checked = $$props.checked);
-    		if ("data" in $$props) $$invalidate(18, data = $$props.data);
-    		if ("showTip" in $$props) $$invalidate(6, showTip = $$props.showTip);
-    		if ("active_hover" in $$props) $$invalidate(29, active_hover = $$props.active_hover);
-    		if ("xScale" in $$props) $$invalidate(7, xScale = $$props.xScale);
-    		if ("xScaleTime" in $$props) $$invalidate(8, xScaleTime = $$props.xScaleTime);
-    		if ("indexToTime" in $$props) $$invalidate(9, indexToTime = $$props.indexToTime);
-    		if ("timeToIndex" in $$props) $$invalidate(30, timeToIndex = $$props.timeToIndex);
-    		if ("yScale" in $$props) $$invalidate(10, yScale = $$props.yScale);
-    		if ("yScaleL" in $$props) $$invalidate(11, yScaleL = $$props.yScaleL);
-    		if ("innerWidth" in $$props) $$invalidate(31, innerWidth = $$props.innerWidth);
-    		if ("barWidth" in $$props) $$invalidate(12, barWidth = $$props.barWidth);
-    		if ("lock" in $$props) $$invalidate(13, lock = $$props.lock);
-    	};
-
-    	let showTip;
-    	let xScale;
-    	let xScaleTime;
-    	let indexToTime;
-    	let timeToIndex;
-    	let yScale;
-    	let yScaleL;
-    	let innerWidth;
-    	let barWidth;
-    	let active_hover;
-    	let lock;
-
-    	if ($$props && "$$inject" in $$props) {
-    		$$self.$inject_state($$props.$$inject);
-    	}
-
-    	$$self.$$.update = () => {
-    		if ($$self.$$.dirty[0] & /*y*/ 2) {
-    			 $$invalidate(7, xScale = linear$1().domain([0, y.length]).range([padding.left, width - padding.right]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*tmax*/ 524288) {
-    			 $$invalidate(8, xScaleTime = linear$1().domain([0, tmax]).range([padding.left, width - padding.right]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*y, tmax*/ 524290) {
-    			 $$invalidate(9, indexToTime = linear$1().domain([0, y.length]).range([0, tmax]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*tmax, y*/ 524290) {
-    			 $$invalidate(30, timeToIndex = linear$1().domain([0, tmax]).range([0, y.length]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*log, ymax*/ 134217736) {
-    			 $$invalidate(10, yScale = (log$1 ? log() : linear$1()).domain([log$1 ? 1 : 0, ymax / 1]).range([height - padding.bottom, padding.top]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*ymax*/ 134217728) {
-    			 $$invalidate(11, yScaleL = log().domain([1, ymax / 1]).range([0, height - padding.bottom - padding.top]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*y*/ 2 | $$self.$$.dirty[1] & /*innerWidth*/ 1) {
-    			 $$invalidate(12, barWidth = innerWidth / y.length - 1.5);
-    		}
-
-    		if ($$self.$$.dirty[0] & /*lock, timeToIndex, active_lock, active_hover*/ 1610620960) {
-    			 $$invalidate(0, active = (function () {
-    				if (lock) {
-    					var i = Math.round(timeToIndex(active_lock));
-
-    					if (i > 99) {
-    						$$invalidate(13, lock = false);
-    						i = 0;
-    					} else {
-    						return i;
-    					}
-    				} else {
-    					return active_hover;
-    				}
-    			})());
-    		}
-    	};
-
-    	 $$invalidate(6, showTip = function (i) {
-    		$$invalidate(29, active_hover = i);
-    	});
-
-    	 $$invalidate(31, innerWidth = width - (padding.left + padding.right));
-    	 $$invalidate(29, active_hover = -1);
-    	 $$invalidate(13, lock = false);
-
-    	return [
-    		active,
-    		y,
-    		colors,
-    		log$1,
-    		checked,
-    		active_lock,
     		showTip,
     		xScale,
     		xScaleTime,
@@ -4231,132 +4017,69 @@
     		yScaleL,
     		barWidth,
     		lock,
-    		sum,
-    		padding,
-    		width,
-    		height,
-    		data,
-    		tmax,
-    		xmax,
-    		deaths,
-    		total,
-    		vline,
-    		timestep,
-    		total_infected,
-    		N,
-    		ymax,
-    		InterventionTime,
-    		active_hover,
-    		timeToIndex,
-    		innerWidth,
-    		dispatch,
+    		Math,
     		mouseover_handler,
     		mouseout_handler,
     		click_handler,
     		mouseover_handler_1,
     		mouseout_handler_1,
     		click_handler_1,
-    		func,
-    		func_1,
     		mouseover_handler_2,
     		mouseout_handler_2,
-    		click_handler_2
-    	];
+    		click_handler_2,
+    		func,
+    		func_1
+    	};
     }
 
     class Chart extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-
-    		init(
-    			this,
-    			options,
-    			instance,
-    			create_fragment,
-    			safe_not_equal,
-    			{
-    				y: 1,
-    				tmax: 19,
-    				xmax: 20,
-    				deaths: 21,
-    				total: 22,
-    				vline: 23,
-    				timestep: 24,
-    				total_infected: 25,
-    				N: 26,
-    				ymax: 27,
-    				InterventionTime: 28,
-    				colors: 2,
-    				log: 3,
-    				active: 0,
-    				checked: 4
-    			},
-    			[-1, -1]
-    		);
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "Chart",
-    			options,
-    			id: create_fragment.name
-    		});
+    		init(this, options, instance, create_fragment, safe_not_equal, ["y", "tmax", "xmax", "deaths", "total", "vline", "timestep", "total_infected", "N", "ymax", "InterventionTime", "colors", "log", "active", "checked"]);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Chart", options, id: create_fragment.name });
 
     		const { ctx } = this.$$;
     		const props = options.props || {};
-
-    		if (/*y*/ ctx[1] === undefined && !("y" in props)) {
+    		if (ctx.y === undefined && !('y' in props)) {
     			console.warn("<Chart> was created without expected prop 'y'");
     		}
-
-    		if (/*tmax*/ ctx[19] === undefined && !("tmax" in props)) {
+    		if (ctx.tmax === undefined && !('tmax' in props)) {
     			console.warn("<Chart> was created without expected prop 'tmax'");
     		}
-
-    		if (/*xmax*/ ctx[20] === undefined && !("xmax" in props)) {
+    		if (ctx.xmax === undefined && !('xmax' in props)) {
     			console.warn("<Chart> was created without expected prop 'xmax'");
     		}
-
-    		if (/*deaths*/ ctx[21] === undefined && !("deaths" in props)) {
+    		if (ctx.deaths === undefined && !('deaths' in props)) {
     			console.warn("<Chart> was created without expected prop 'deaths'");
     		}
-
-    		if (/*total*/ ctx[22] === undefined && !("total" in props)) {
+    		if (ctx.total === undefined && !('total' in props)) {
     			console.warn("<Chart> was created without expected prop 'total'");
     		}
-
-    		if (/*vline*/ ctx[23] === undefined && !("vline" in props)) {
+    		if (ctx.vline === undefined && !('vline' in props)) {
     			console.warn("<Chart> was created without expected prop 'vline'");
     		}
-
-    		if (/*timestep*/ ctx[24] === undefined && !("timestep" in props)) {
+    		if (ctx.timestep === undefined && !('timestep' in props)) {
     			console.warn("<Chart> was created without expected prop 'timestep'");
     		}
-
-    		if (/*total_infected*/ ctx[25] === undefined && !("total_infected" in props)) {
+    		if (ctx.total_infected === undefined && !('total_infected' in props)) {
     			console.warn("<Chart> was created without expected prop 'total_infected'");
     		}
-
-    		if (/*N*/ ctx[26] === undefined && !("N" in props)) {
+    		if (ctx.N === undefined && !('N' in props)) {
     			console.warn("<Chart> was created without expected prop 'N'");
     		}
-
-    		if (/*ymax*/ ctx[27] === undefined && !("ymax" in props)) {
+    		if (ctx.ymax === undefined && !('ymax' in props)) {
     			console.warn("<Chart> was created without expected prop 'ymax'");
     		}
-
-    		if (/*InterventionTime*/ ctx[28] === undefined && !("InterventionTime" in props)) {
+    		if (ctx.InterventionTime === undefined && !('InterventionTime' in props)) {
     			console.warn("<Chart> was created without expected prop 'InterventionTime'");
     		}
-
-    		if (/*colors*/ ctx[2] === undefined && !("colors" in props)) {
+    		if (ctx.colors === undefined && !('colors' in props)) {
     			console.warn("<Chart> was created without expected prop 'colors'");
     		}
-
-    		if (/*active*/ ctx[0] === undefined && !("active" in props)) {
+    		if (ctx.active === undefined && !('active' in props)) {
     			console.warn("<Chart> was created without expected prop 'active'");
     		}
-
-    		if (/*checked*/ ctx[4] === undefined && !("checked" in props)) {
+    		if (ctx.checked === undefined && !('checked' in props)) {
     			console.warn("<Chart> was created without expected prop 'checked'");
     		}
     	}
@@ -4956,16 +4679,12 @@
     var queryString_4 = queryString.parseUrl;
     var queryString_5 = queryString.stringifyUrl;
 
-    /* src/Checkbox.svelte generated by Svelte v3.20.1 */
+    /* src/Checkbox.svelte generated by Svelte v3.12.1 */
 
     const file$1 = "src/Checkbox.svelte";
 
     function create_fragment$1(ctx) {
-    	let div1;
-    	let div0;
-    	let t_value = (/*checked*/ ctx[0] ? "✓" : "") + "";
-    	let t;
-    	let dispose;
+    	var div1, div0, t_value = ctx.checked?"✓":"" + "", t, dispose;
 
     	const block = {
     		c: function create() {
@@ -4984,119 +4703,90 @@
     			set_style(div1, "top", "3px");
     			set_style(div1, "width", "13px");
     			set_style(div1, "height", "13px");
-    			set_style(div1, "background-color", /*checked*/ ctx[0] ? /*color*/ ctx[1] : "white");
+    			set_style(div1, "background-color", (ctx.checked ? ctx.color:'white'));
     			set_style(div1, "border-radius", "3px");
     			set_style(div1, "opacity", "0.8");
-
-    			set_style(div1, "border", "2px solid " + (/*checked*/ ctx[0]
-    			? "rgba(255,255,255,0)"
-    			: /*color*/ ctx[1]));
-
+    			set_style(div1, "border", "2px solid " + (ctx.checked ? 'rgba(255,255,255,0)':ctx.color));
     			set_style(div1, "box-shadow", "inset 1px 1px 3px rgba(0, 0, 0, 0.1)");
     			set_style(div1, "user-select", "none");
     			add_location(div1, file$1, 6, 0, 101);
+    			dispose = listen_dev(div1, "click", ctx.click_handler);
     		},
+
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
-    		m: function mount(target, anchor, remount) {
+
+    		m: function mount(target, anchor) {
     			insert_dev(target, div1, anchor);
     			append_dev(div1, div0);
     			append_dev(div0, t);
-    			if (remount) dispose();
-    			dispose = listen_dev(div1, "click", /*click_handler*/ ctx[3], false, false, false);
     		},
-    		p: function update(ctx, [dirty]) {
-    			if (dirty & /*checked*/ 1 && t_value !== (t_value = (/*checked*/ ctx[0] ? "✓" : "") + "")) set_data_dev(t, t_value);
 
-    			if (dirty & /*checked, color*/ 3) {
-    				set_style(div1, "background-color", /*checked*/ ctx[0] ? /*color*/ ctx[1] : "white");
+    		p: function update(changed, ctx) {
+    			if ((changed.checked) && t_value !== (t_value = ctx.checked?"✓":"" + "")) {
+    				set_data_dev(t, t_value);
     			}
 
-    			if (dirty & /*checked, color*/ 3) {
-    				set_style(div1, "border", "2px solid " + (/*checked*/ ctx[0]
-    				? "rgba(255,255,255,0)"
-    				: /*color*/ ctx[1]));
+    			if (changed.checked || changed.color) {
+    				set_style(div1, "background-color", (ctx.checked ? ctx.color:'white'));
+    				set_style(div1, "border", "2px solid " + (ctx.checked ? 'rgba(255,255,255,0)':ctx.color));
     			}
     		},
+
     		i: noop,
     		o: noop,
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div1);
+    			if (detaching) {
+    				detach_dev(div1);
+    			}
+
     			dispose();
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment$1.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$1.name, type: "component", source: "", ctx });
     	return block;
     }
 
     function instance$1($$self, $$props, $$invalidate) {
-    	let { color } = $$props;
-    	let { checked = false } = $$props;
+    	let { color, checked = false, callback = () => {} } = $$props;
 
-    	let { callback = () => {
-    		
-    	} } = $$props;
-
-    	const writable_props = ["color", "checked", "callback"];
-
+    	const writable_props = ['color', 'checked', 'callback'];
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Checkbox> was created with unknown prop '${key}'`);
+    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Checkbox> was created with unknown prop '${key}'`);
     	});
 
-    	let { $$slots = {}, $$scope } = $$props;
-    	validate_slots("Checkbox", $$slots, []);
-
-    	const click_handler = () => {
-    		$$invalidate(0, checked = !checked);
-    		callback(checked);
-    	};
+    	const click_handler = () => {$$invalidate('checked', checked = !checked); callback(checked);};
 
     	$$self.$set = $$props => {
-    		if ("color" in $$props) $$invalidate(1, color = $$props.color);
-    		if ("checked" in $$props) $$invalidate(0, checked = $$props.checked);
-    		if ("callback" in $$props) $$invalidate(2, callback = $$props.callback);
+    		if ('color' in $$props) $$invalidate('color', color = $$props.color);
+    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
+    		if ('callback' in $$props) $$invalidate('callback', callback = $$props.callback);
     	};
 
-    	$$self.$capture_state = () => ({ color, checked, callback });
+    	$$self.$capture_state = () => {
+    		return { color, checked, callback };
+    	};
 
     	$$self.$inject_state = $$props => {
-    		if ("color" in $$props) $$invalidate(1, color = $$props.color);
-    		if ("checked" in $$props) $$invalidate(0, checked = $$props.checked);
-    		if ("callback" in $$props) $$invalidate(2, callback = $$props.callback);
+    		if ('color' in $$props) $$invalidate('color', color = $$props.color);
+    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
+    		if ('callback' in $$props) $$invalidate('callback', callback = $$props.callback);
     	};
 
-    	if ($$props && "$$inject" in $$props) {
-    		$$self.$inject_state($$props.$$inject);
-    	}
-
-    	return [checked, color, callback, click_handler];
+    	return { color, checked, callback, click_handler };
     }
 
     class Checkbox extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, { color: 1, checked: 0, callback: 2 });
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "Checkbox",
-    			options,
-    			id: create_fragment$1.name
-    		});
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, ["color", "checked", "callback"]);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Checkbox", options, id: create_fragment$1.name });
 
     		const { ctx } = this.$$;
     		const props = options.props || {};
-
-    		if (/*color*/ ctx[1] === undefined && !("color" in props)) {
+    		if (ctx.color === undefined && !('color' in props)) {
     			console.warn("<Checkbox> was created without expected prop 'color'");
     		}
     	}
@@ -5126,24 +4816,12 @@
     	}
     }
 
-    /* src/Arrow.svelte generated by Svelte v3.20.1 */
+    /* src/Arrow.svelte generated by Svelte v3.12.1 */
 
     const file$2 = "src/Arrow.svelte";
 
     function create_fragment$2(ctx) {
-    	let svg0;
-    	let defs0;
-    	let marker0;
-    	let path;
-    	let defs1;
-    	let marker1;
-    	let circle;
-    	let t;
-    	let div;
-    	let svg1;
-    	let line;
-    	let line_y__value;
-    	let line_marker_end_value;
+    	var svg0, defs0, marker0, path, defs1, marker1, circle, t, div, svg1, line, line_y__value, line_marker_end_value;
 
     	const block = {
     		c: function create() {
@@ -5192,18 +4870,18 @@
     			attr_dev(line, "x1", "8");
     			attr_dev(line, "y1", "0");
     			attr_dev(line, "x2", "8");
-    			attr_dev(line, "y2", line_y__value = /*height*/ ctx[0] - 5);
+    			attr_dev(line, "y2", line_y__value = ctx.height-5);
     			attr_dev(line, "stroke", "grey");
     			attr_dev(line, "stroke-width", "1.5");
-    			attr_dev(line, "marker-end", line_marker_end_value = "url(" + /*arrowhead*/ ctx[1] + ")");
-    			attr_dev(line, "stroke-dasharray", /*dasharray*/ ctx[2]);
+    			attr_dev(line, "marker-end", line_marker_end_value = "url(" + ctx.arrowhead + ")");
+    			attr_dev(line, "stroke-dasharray", ctx.dasharray);
     			add_location(line, file$2, 39, 2, 892);
     			add_location(svg1, file$2, 38, 0, 884);
     			set_style(div, "position", "absolute");
     			set_style(div, "left", "-1px");
     			set_style(div, "top", "4px");
     			set_style(div, "width", "15px");
-    			set_style(div, "height", /*height*/ ctx[0] + "px");
+    			set_style(div, "height", "" + ctx.height + "px");
     			set_style(div, "background-color", "none");
     			set_style(div, "border-radius", "5px");
     			set_style(div, "top", "25px");
@@ -5211,9 +4889,11 @@
     			set_style(div, "pointer-events", "None");
     			add_location(div, file$2, 37, 0, 707);
     		},
+
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, svg0, anchor);
     			append_dev(svg0, defs0);
@@ -5227,93 +4907,76 @@
     			append_dev(div, svg1);
     			append_dev(svg1, line);
     		},
-    		p: function update(ctx, [dirty]) {
-    			if (dirty & /*height*/ 1 && line_y__value !== (line_y__value = /*height*/ ctx[0] - 5)) {
+
+    		p: function update(changed, ctx) {
+    			if ((changed.height) && line_y__value !== (line_y__value = ctx.height-5)) {
     				attr_dev(line, "y2", line_y__value);
     			}
 
-    			if (dirty & /*arrowhead*/ 2 && line_marker_end_value !== (line_marker_end_value = "url(" + /*arrowhead*/ ctx[1] + ")")) {
+    			if ((changed.arrowhead) && line_marker_end_value !== (line_marker_end_value = "url(" + ctx.arrowhead + ")")) {
     				attr_dev(line, "marker-end", line_marker_end_value);
     			}
 
-    			if (dirty & /*dasharray*/ 4) {
-    				attr_dev(line, "stroke-dasharray", /*dasharray*/ ctx[2]);
+    			if (changed.dasharray) {
+    				attr_dev(line, "stroke-dasharray", ctx.dasharray);
     			}
 
-    			if (dirty & /*height*/ 1) {
-    				set_style(div, "height", /*height*/ ctx[0] + "px");
+    			if (changed.height) {
+    				set_style(div, "height", "" + ctx.height + "px");
     			}
     		},
+
     		i: noop,
     		o: noop,
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(svg0);
-    			if (detaching) detach_dev(t);
-    			if (detaching) detach_dev(div);
+    			if (detaching) {
+    				detach_dev(svg0);
+    				detach_dev(t);
+    				detach_dev(div);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment$2.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$2.name, type: "component", source: "", ctx });
     	return block;
     }
 
     function instance$2($$self, $$props, $$invalidate) {
-    	let { height } = $$props;
-    	let { arrowhead = "#arrow" } = $$props;
-    	let { dasharray = "0 0" } = $$props;
-    	const writable_props = ["height", "arrowhead", "dasharray"];
+    	let { height, arrowhead = "#arrow", dasharray = "0 0" } = $$props;
 
+    	const writable_props = ['height', 'arrowhead', 'dasharray'];
     	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<Arrow> was created with unknown prop '${key}'`);
+    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Arrow> was created with unknown prop '${key}'`);
     	});
 
-    	let { $$slots = {}, $$scope } = $$props;
-    	validate_slots("Arrow", $$slots, []);
-
     	$$self.$set = $$props => {
-    		if ("height" in $$props) $$invalidate(0, height = $$props.height);
-    		if ("arrowhead" in $$props) $$invalidate(1, arrowhead = $$props.arrowhead);
-    		if ("dasharray" in $$props) $$invalidate(2, dasharray = $$props.dasharray);
+    		if ('height' in $$props) $$invalidate('height', height = $$props.height);
+    		if ('arrowhead' in $$props) $$invalidate('arrowhead', arrowhead = $$props.arrowhead);
+    		if ('dasharray' in $$props) $$invalidate('dasharray', dasharray = $$props.dasharray);
     	};
 
-    	$$self.$capture_state = () => ({ height, arrowhead, dasharray });
+    	$$self.$capture_state = () => {
+    		return { height, arrowhead, dasharray };
+    	};
 
     	$$self.$inject_state = $$props => {
-    		if ("height" in $$props) $$invalidate(0, height = $$props.height);
-    		if ("arrowhead" in $$props) $$invalidate(1, arrowhead = $$props.arrowhead);
-    		if ("dasharray" in $$props) $$invalidate(2, dasharray = $$props.dasharray);
+    		if ('height' in $$props) $$invalidate('height', height = $$props.height);
+    		if ('arrowhead' in $$props) $$invalidate('arrowhead', arrowhead = $$props.arrowhead);
+    		if ('dasharray' in $$props) $$invalidate('dasharray', dasharray = $$props.dasharray);
     	};
 
-    	if ($$props && "$$inject" in $$props) {
-    		$$self.$inject_state($$props.$$inject);
-    	}
-
-    	return [height, arrowhead, dasharray];
+    	return { height, arrowhead, dasharray };
     }
 
     class Arrow extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, { height: 0, arrowhead: 1, dasharray: 2 });
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "Arrow",
-    			options,
-    			id: create_fragment$2.name
-    		});
+    		init(this, options, instance$2, create_fragment$2, safe_not_equal, ["height", "arrowhead", "dasharray"]);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Arrow", options, id: create_fragment$2.name });
 
     		const { ctx } = this.$$;
     		const props = options.props || {};
-
-    		if (/*height*/ ctx[0] === undefined && !("height" in props)) {
+    		if (ctx.height === undefined && !('height' in props)) {
     			console.warn("<Arrow> was created without expected prop 'height'");
     		}
     	}
@@ -22761,22 +22424,19 @@
 
     var katex$1 = unwrapExports(katex);
 
-    /* src/App.svelte generated by Svelte v3.20.1 */
+    /* src/App.svelte generated by Svelte v3.12.1 */
+
     const file$3 = "src/App.svelte";
 
     function get_each_context$1(ctx, list, i) {
-    	const child_ctx = ctx.slice();
-    	child_ctx[85] = list[i];
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.milestone = list[i];
     	return child_ctx;
     }
 
     // (792:8) {#if xScaleTime(InterventionTime) >= 100}
     function create_if_block$1(ctx) {
-    	let div;
-    	let span;
-    	let t;
-    	let html_tag;
-    	let raw_value = math_inline("\\mathcal{R}_0=" + /*R0*/ ctx[5].toFixed(2)) + "";
+    	var div, span, t, html_tag, raw_value = math_inline("\\mathcal{R}_0=" + (ctx.R0).toFixed(2) ) + "";
 
     	const block = {
     		c: function create() {
@@ -22793,55 +22453,48 @@
     			set_style(div, "width", "120px");
     			add_location(div, file$3, 792, 10, 26955);
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, div, anchor);
     			append_dev(div, span);
     			append_dev(span, t);
     			html_tag.m(span);
     		},
-    		p: function update(ctx, dirty) {
-    			if (dirty[0] & /*R0*/ 32 && raw_value !== (raw_value = math_inline("\\mathcal{R}_0=" + /*R0*/ ctx[5].toFixed(2)) + "")) html_tag.p(raw_value);
+
+    		p: function update(changed, ctx) {
+    			if ((changed.R0) && raw_value !== (raw_value = math_inline("\\mathcal{R}_0=" + (ctx.R0).toFixed(2) ) + "")) {
+    				html_tag.p(raw_value);
+    			}
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div);
+    			if (detaching) {
+    				detach_dev(div);
+    			}
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_if_block$1.name,
-    		type: "if",
-    		source: "(792:8) {#if xScaleTime(InterventionTime) >= 100}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$1.name, type: "if", source: "(792:8) {#if xScaleTime(InterventionTime) >= 100}", ctx });
     	return block;
     }
 
     // (856:12) {#each milestones as milestone}
     function create_each_block$1(ctx) {
-    	let div1;
-    	let span;
-    	let t0;
-    	let div0;
-    	let raw_value = /*milestone*/ ctx[85][1] + "";
-    	let t1;
-    	let current;
+    	var div1, span, t0, div0, raw_value = ctx.milestone[1] + "", t1, current;
 
-    	const arrow = new Arrow({
-    			props: {
-    				height: "30",
-    				arrowhead: "#circle",
-    				dasharray: "2 1"
-    			},
-    			$$inline: true
-    		});
+    	var arrow = new Arrow({
+    		props: {
+    		height: "30",
+    		arrowhead: "#circle",
+    		dasharray: "2 1"
+    	},
+    		$$inline: true
+    	});
 
     	const block = {
     		c: function create() {
     			div1 = element("div");
     			span = element("span");
-    			create_component(arrow.$$.fragment);
+    			arrow.$$.fragment.c();
     			t0 = space();
     			div0 = element("div");
     			t1 = space();
@@ -22858,10 +22511,11 @@
     			set_style(div0, "padding-right", "4px");
     			add_location(div0, file$3, 858, 18, 30260);
     			set_style(div1, "position", "absolute");
-    			set_style(div1, "left", /*xScaleTime*/ ctx[27](/*milestone*/ ctx[85][0]) + 8 + "px");
+    			set_style(div1, "left", "" + (ctx.xScaleTime(ctx.milestone[0])+8) + "px");
     			set_style(div1, "top", "-30px");
     			add_location(div1, file$3, 856, 14, 30052);
     		},
+
     		m: function mount(target, anchor) {
     			insert_dev(target, div1, anchor);
     			append_dev(div1, span);
@@ -22872,885 +22526,207 @@
     			append_dev(div1, t1);
     			current = true;
     		},
-    		p: function update(ctx, dirty) {
-    			if ((!current || dirty[1] & /*milestones*/ 8) && raw_value !== (raw_value = /*milestone*/ ctx[85][1] + "")) div0.innerHTML = raw_value;
-    			if (!current || dirty[0] & /*xScaleTime*/ 134217728 | dirty[1] & /*milestones*/ 8) {
-    				set_style(div1, "left", /*xScaleTime*/ ctx[27](/*milestone*/ ctx[85][0]) + 8 + "px");
+
+    		p: function update(changed, ctx) {
+    			if ((!current || changed.milestones) && raw_value !== (raw_value = ctx.milestone[1] + "")) {
+    				div0.innerHTML = raw_value;
+    			}
+
+    			if (!current || changed.xScaleTime || changed.milestones) {
+    				set_style(div1, "left", "" + (ctx.xScaleTime(ctx.milestone[0])+8) + "px");
     			}
     		},
+
     		i: function intro(local) {
     			if (current) return;
     			transition_in(arrow.$$.fragment, local);
+
     			current = true;
     		},
+
     		o: function outro(local) {
     			transition_out(arrow.$$.fragment, local);
     			current = false;
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(div1);
+    			if (detaching) {
+    				detach_dev(div1);
+    			}
+
     			destroy_component(arrow);
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_each_block$1.name,
-    		type: "each",
-    		source: "(856:12) {#each milestones as milestone}",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block$1.name, type: "each", source: "(856:12) {#each milestones as milestone}", ctx });
     	return block;
     }
 
     function create_fragment$3(ctx) {
-    	let link;
-    	let t0;
-    	let h2;
-    	let t2;
-    	let div75;
-    	let div50;
-    	let div49;
-    	let div0;
-    	let b0;
-    	let br0;
-    	let t4;
-    	let t5_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "";
-    	let t5;
-    	let t6;
-    	let div7;
-    	let span0;
-    	let t7;
-    	let t8;
-    	let div5;
-    	let div1;
-    	let t10;
-    	let div4;
-    	let div2;
-    	let span1;
-    	let t12;
-    	let i0;
-    	let t13_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0])) + "";
-    	let t13;
-    	let t14;
-    	let t15_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0]).toFixed(2) + "";
-    	let t15;
-    	let t16;
-    	let t17;
-    	let div3;
-    	let span2;
-    	let t19;
-    	let i1;
-    	let t20_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[0])) + "";
-    	let t20;
-    	let t21;
-    	let t22;
-    	let div6;
-    	let t24;
-    	let div14;
-    	let updating_checked;
-    	let t25;
-    	let t26;
-    	let div12;
-    	let div8;
-    	let t28;
-    	let div11;
-    	let div9;
-    	let span3;
-    	let t30;
-    	let i2;
-    	let t31_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1])) + "";
-    	let t31;
-    	let t32;
-    	let t33_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1]).toFixed(2) + "";
-    	let t33;
-    	let t34;
-    	let t35;
-    	let div10;
-    	let span4;
-    	let t37;
-    	let i3;
-    	let t38_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[1])) + "";
-    	let t38;
-    	let t39;
-    	let t40;
-    	let div13;
-    	let t42;
-    	let div21;
-    	let updating_checked_1;
-    	let t43;
-    	let t44;
-    	let div19;
-    	let div15;
-    	let t46;
-    	let div18;
-    	let div16;
-    	let span5;
-    	let t48;
-    	let i4;
-    	let t49_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2])) + "";
-    	let t49;
-    	let t50;
-    	let t51_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]).toFixed(2) + "";
-    	let t51;
-    	let t52;
-    	let t53;
-    	let div17;
-    	let span6;
-    	let t55;
-    	let i5;
-    	let t56_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[2])) + "";
-    	let t56;
-    	let t57;
-    	let t58;
-    	let div20;
-    	let t59;
-    	let i6;
-    	let t61;
-    	let t62;
-    	let div28;
-    	let t63;
-    	let t64;
-    	let div26;
-    	let div22;
-    	let t66;
-    	let div25;
-    	let div23;
-    	let span7;
-    	let t68;
-    	let i7;
-    	let t69_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]) + /*I0*/ ctx[4])) + "";
-    	let t69;
-    	let t70;
-    	let t71_value = (100 * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] - /*I0*/ ctx[4] / /*N*/ ctx[3])).toFixed(2) + "";
-    	let t71;
-    	let t72;
-    	let t73;
-    	let div24;
-    	let span8;
-    	let t75;
-    	let i8;
-    	let t76_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[3] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[4] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[7]))) + "";
-    	let t76;
-    	let t77;
-    	let t78;
-    	let div27;
-    	let t80;
-    	let div34;
-    	let updating_checked_2;
-    	let t81;
-    	let t82;
-    	let div32;
-    	let div29;
-    	let t84;
-    	let div31;
-    	let div30;
-    	let span9;
-    	let t86;
-    	let i9;
-    	let t87_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8]))) + "";
-    	let t87;
-    	let t88;
-    	let t89_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8])).toFixed(2) + "";
-    	let t89;
-    	let t90;
-    	let t91;
-    	let div33;
-    	let t93;
-    	let div41;
-    	let t94;
-    	let updating_checked_3;
-    	let t95;
-    	let div39;
-    	let div35;
-    	let t97;
-    	let div37;
-    	let div36;
-    	let span10;
-    	let t99;
-    	let i10;
-    	let t100_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6]))) + "";
-    	let t100;
-    	let t101;
-    	let t102_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6])).toFixed(2) + "";
-    	let t102;
-    	let t103;
-    	let t104;
-    	let div38;
-    	let span11;
-    	let t106;
-    	let i11;
-    	let t107_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6]))) + "";
-    	let t107;
-    	let t108;
-    	let t109;
-    	let div40;
-    	let t111;
-    	let div48;
-    	let t112;
-    	let updating_checked_4;
-    	let t113;
-    	let div46;
-    	let div42;
-    	let t115;
-    	let div45;
-    	let div43;
-    	let span12;
-    	let t117;
-    	let i12;
-    	let t118_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9])) + "";
-    	let t118;
-    	let t119;
-    	let t120_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9]).toFixed(2) + "";
-    	let t120;
-    	let t121;
-    	let t122;
-    	let div44;
-    	let span13;
-    	let t124;
-    	let i13;
-    	let t125_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[9])) + "";
-    	let t125;
-    	let t126;
-    	let t127;
-    	let div47;
-    	let t129;
-    	let div74;
-    	let div51;
-    	let updating_checked_5;
-    	let updating_active;
-    	let t130;
-    	let div52;
-    	let t131;
-    	let div53;
-    	let t132;
-    	let div61;
-    	let div60;
-    	let div54;
-    	let span14;
-    	let raw0_value = math_inline("\\mathcal{R}_t=" + (/*R0*/ ctx[5] * /*InterventionAmt*/ ctx[13]).toFixed(2)) + "";
-    	let t133;
-    	let t134;
-    	let show_if = /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 100;
-    	let t135;
-    	let div58;
-    	let div55;
-    	let t136;
-    	let t137_value = format("d")(/*InterventionTime*/ ctx[12]) + "";
-    	let t137;
-    	let t138;
-    	let span15;
-    	let div56;
-    	let t140;
-    	let div57;
-    	let svg;
-    	let g1;
-    	let g0;
-    	let path;
-    	let t141;
-    	let div59;
-    	let t142;
-    	let div69;
-    	let div68;
-    	let div67;
-    	let div66;
-    	let div63;
-    	let div62;
-    	let t143;
-    	let br1;
-    	let t144;
-    	let div65;
-    	let div64;
-    	let t145_value = /*InterventionAmt*/ ctx[13].toFixed(2) + "";
-    	let t145;
-    	let t146;
-    	let input0;
-    	let t147;
-    	let div70;
-    	let t148;
-    	let div73;
-    	let div72;
-    	let updating_checked_6;
-    	let div71;
-    	let t150;
-    	let div117;
-    	let div79;
-    	let div76;
-    	let t152;
-    	let div77;
-    	let t153;
-    	let div78;
-    	let t155;
-    	let div116;
-    	let div85;
-    	let div80;
-    	let t157;
-    	let div81;
-    	let t158;
-    	let br2;
-    	let t159;
-    	let div82;
-    	let t160_value = format(",")(Math.round(/*N*/ ctx[3])) + "";
-    	let t160;
-    	let t161;
-    	let input1;
-    	let input1_min_value;
-    	let t162;
-    	let div83;
-    	let t163;
-    	let br3;
-    	let t164;
-    	let div84;
-    	let t165;
-    	let t166;
-    	let input2;
-    	let input2_min_value;
-    	let t167;
-    	let div90;
-    	let div88;
-    	let div86;
-    	let t168;
-    	let html_tag;
-    	let raw1_value = math_inline("\\mathcal{R}_0") + "";
-    	let t169;
-    	let div87;
-    	let t170;
-    	let br4;
-    	let t171;
-    	let div89;
-    	let t172;
-    	let t173;
-    	let input3;
-    	let t174;
-    	let div96;
-    	let div91;
-    	let t176;
-    	let div92;
-    	let t177;
-    	let html_tag_1;
-    	let raw2_value = math_inline("T_{\\text{inc}}") + "";
-    	let t178;
-    	let br5;
-    	let t179;
-    	let div93;
-    	let t180_value = /*D_incbation*/ ctx[6].toFixed(2) + "";
-    	let t180;
-    	let t181;
-    	let t182;
-    	let input4;
-    	let input4_min_value;
-    	let t183;
-    	let div94;
-    	let t184;
-    	let html_tag_2;
-    	let raw3_value = math_inline("T_{\\text{inf}}") + "";
-    	let t185;
-    	let br6;
-    	let t186;
-    	let div95;
-    	let t187;
-    	let t188;
-    	let t189;
-    	let input5;
-    	let input5_min_value;
-    	let t190;
-    	let div97;
-    	let t191;
-    	let div103;
-    	let div98;
-    	let t193;
-    	let div99;
-    	let t194;
-    	let br7;
-    	let t195;
-    	let div100;
-    	let t196_value = (/*CFR*/ ctx[11] * 100).toFixed(2) + "";
-    	let t196;
-    	let t197;
-    	let t198;
-    	let input6;
-    	let input6_min_value;
-    	let t199;
-    	let div101;
-    	let t200;
-    	let br8;
-    	let t201;
-    	let div102;
-    	let t202;
-    	let t203;
-    	let t204;
-    	let input7;
-    	let input7_min_value;
-    	let t205;
-    	let div109;
-    	let div104;
-    	let t207;
-    	let div105;
-    	let t208;
-    	let br9;
-    	let t209;
-    	let div106;
-    	let t210;
-    	let t211;
-    	let t212;
-    	let input8;
-    	let input8_min_value;
-    	let t213;
-    	let div107;
-    	let t214;
-    	let br10;
-    	let t215;
-    	let div108;
-    	let t216;
-    	let t217;
-    	let t218;
-    	let input9;
-    	let input9_min_value;
-    	let t219;
-    	let div115;
-    	let div110;
-    	let t221;
-    	let div111;
-    	let t222;
-    	let br11;
-    	let t223;
-    	let div112;
-    	let t224_value = (/*P_SEVERE*/ ctx[15] * 100).toFixed(2) + "";
-    	let t224;
-    	let t225;
-    	let t226;
-    	let input10;
-    	let input10_min_value;
-    	let t227;
-    	let div113;
-    	let t228;
-    	let br12;
-    	let t229;
-    	let div114;
-    	let t230;
-    	let t231;
-    	let t232;
-    	let input11;
-    	let input11_min_value;
-    	let t233;
-    	let div118;
-    	let t234;
-    	let p0;
-    	let t235;
-    	let br13;
-    	let t236;
-    	let br14;
-    	let t237;
-    	let br15;
-    	let t238;
-    	let p1;
-    	let t239;
-    	let b1;
-    	let a0;
-    	let t241;
-    	let t242;
-    	let b2;
-    	let t244;
-    	let span16;
-    	let b3;
-    	let t246;
-    	let span17;
-    	let b4;
-    	let t248;
-    	let span18;
-    	let b5;
-    	let t250;
-    	let a1;
-    	let t252;
-    	let a2;
-    	let t254;
-    	let span19;
-    	let t255;
-    	let t256;
-    	let p2;
-    	let t257;
-    	let t258_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "";
-    	let t258;
-    	let t259;
-    	let a3;
-    	let t261;
-    	let input12;
-    	let t262;
-    	let t263_value = ((1 - Math.pow(1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] * (0.45 / 100), /*p_num_ind*/ ctx[32])) * 100).toFixed(5) + "";
-    	let t263;
-    	let t264;
-    	let a4;
-    	let t266;
-    	let t267;
-    	let p3;
-    	let t269;
-    	let div119;
-    	let table;
-    	let tr0;
-    	let th0;
-    	let t270;
-    	let th1;
-    	let t272;
-    	let th2;
-    	let t273;
-    	let br16;
-    	let t274;
-    	let html_tag_3;
-    	let raw5_value = math_inline("\\mathcal{R}_0") + "";
-    	let t275;
-    	let th3;
-    	let t276;
-    	let br17;
-    	let t277;
-    	let html_tag_4;
-    	let raw6_value = math_inline("T_{\\text{inc}}") + "";
-    	let t278;
-    	let t279;
-    	let th4;
-    	let t280;
-    	let br18;
-    	let t281;
-    	let html_tag_5;
-    	let raw7_value = math_inline("T_{\\text{inf}}") + "";
-    	let t282;
-    	let t283;
-    	let tr1;
-    	let td0;
-    	let a5;
-    	let t285;
-    	let td1;
-    	let t287;
-    	let td2;
-    	let t289;
-    	let td3;
-    	let t291;
-    	let td4;
-    	let t293;
-    	let tr2;
-    	let td5;
-    	let a6;
-    	let t295;
-    	let td6;
-    	let t297;
-    	let td7;
-    	let t299;
-    	let td8;
-    	let t301;
-    	let td9;
-    	let t303;
-    	let tr3;
-    	let td10;
-    	let a7;
-    	let t305;
-    	let td11;
-    	let t307;
-    	let td12;
-    	let t309;
-    	let td13;
-    	let t311;
-    	let td14;
-    	let t313;
-    	let tr4;
-    	let td15;
-    	let a8;
-    	let t315;
-    	let td16;
-    	let t317;
-    	let td17;
-    	let t319;
-    	let td18;
-    	let t320;
-    	let td19;
-    	let t321;
-    	let tr5;
-    	let td20;
-    	let a9;
-    	let t323;
-    	let td21;
-    	let t325;
-    	let td22;
-    	let t327;
-    	let td23;
-    	let t329;
-    	let td24;
-    	let t330;
-    	let tr6;
-    	let td25;
-    	let a10;
-    	let t332;
-    	let td26;
-    	let t334;
-    	let td27;
-    	let t336;
-    	let td28;
-    	let t338;
-    	let td29;
-    	let t340;
-    	let tr7;
-    	let td30;
-    	let a11;
-    	let t342;
-    	let td31;
-    	let t344;
-    	let td32;
-    	let t346;
-    	let td33;
-    	let t348;
-    	let td34;
-    	let t350;
-    	let tr8;
-    	let td35;
-    	let a12;
-    	let t352;
-    	let td36;
-    	let t354;
-    	let td37;
-    	let t355;
-    	let td38;
-    	let t357;
-    	let td39;
-    	let t358;
-    	let tr9;
-    	let td40;
-    	let a13;
-    	let t360;
-    	let td41;
-    	let t362;
-    	let td42;
-    	let t364;
-    	let td43;
-    	let t365;
-    	let td44;
-    	let t366;
-    	let tr10;
-    	let td45;
-    	let a14;
-    	let t368;
-    	let td46;
-    	let t370;
-    	let td47;
-    	let t371;
-    	let td48;
-    	let t373;
-    	let td49;
-    	let t375;
-    	let td50;
-    	let t376;
-    	let tr11;
-    	let td51;
-    	let a15;
-    	let t378;
-    	let td52;
-    	let t380;
-    	let td53;
-    	let t382;
-    	let td54;
-    	let t383;
-    	let td55;
-    	let t384;
-    	let p4;
-    	let t385;
-    	let a16;
-    	let t387;
-    	let a17;
-    	let t389;
-    	let t390;
-    	let p5;
-    	let t391;
-    	let a18;
-    	let t393;
-    	let a19;
-    	let t395;
-    	let a20;
-    	let t397;
-    	let t398;
-    	let p6;
-    	let b6;
-    	let br19;
-    	let t400;
-    	let html_tag_6;
-    	let raw8_value = math_inline("I, R") + "";
-    	let t401;
-    	let i14;
-    	let t403;
-    	let i15;
-    	let t405;
-    	let i16;
-    	let t407;
-    	let t408;
-    	let p7;
-    	let b7;
-    	let br20;
-    	let t410;
-    	let a21;
-    	let t412;
-    	let a22;
-    	let t414;
-    	let a23;
-    	let t416;
-    	let a24;
-    	let t418;
-    	let t419;
-    	let div122;
-    	let div121;
-    	let div120;
-    	let t421;
-    	let form;
-    	let textarea;
-    	let current;
-    	let dispose;
-    	const checkbox0 = new Checkbox({ props: { color: "#CCC" }, $$inline: true });
-    	const arrow0 = new Arrow({ props: { height: "41" }, $$inline: true });
+    	var link, t0, h2, t2, div75, div50, div49, div0, b0, br0, t4, t5_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "", t5, t6, div7, span0, t7, t8, div5, div1, t10, div4, div2, span1, t12, i0, t13_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][0])) + "", t13, t14, t15_value = (100*ctx.Iters[ctx.active_][0]).toFixed(2) + "", t15, t16, t17, div3, span2, t19, i1, t20_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[0])) + "", t20, t21, t22, div6, t24, div14, updating_checked, t25, t26, div12, div8, t28, div11, div9, span3, t30, i2, t31_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][1])) + "", t31, t32, t33_value = (100*ctx.Iters[ctx.active_][1]).toFixed(2) + "", t33, t34, t35, div10, span4, t37, i3, t38_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[1])) + "", t38, t39, t40, div13, t42, div21, updating_checked_1, t43, t44, div19, div15, t46, div18, div16, span5, t48, i4, t49_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][2])) + "", t49, t50, t51_value = (100*ctx.Iters[ctx.active_][2]).toFixed(2) + "", t51, t52, t53, div17, span6, t55, i5, t56_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[2])) + "", t56, t57, t58, div20, t59, i6, t61, t62, div28, t63, t64, div26, div22, t66, div25, div23, span7, t68, i7, t69_value = formatNumber$1(ctx.Math.round(ctx.N* (1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2])+ctx.I0 )) + "", t69, t70, t71_value = ((100*(1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2]-ctx.I0/ctx.N))).toFixed(2) + "", t71, t72, t73, div24, span8, t75, i8, t76_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[3]+ctx.get_d(ctx.active_)[4]+ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]+ctx.get_d(ctx.active_)[7]) )) + "", t76, t77, t78, div27, t80, div34, updating_checked_2, t81, t82, div32, div29, t84, div31, div30, span9, t86, i9, t87_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8]) )) + "", t87, t88, t89_value = (100*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8])).toFixed(2) + "", t89, t90, t91, div33, t93, div41, t94, updating_checked_3, t95, div39, div35, t97, div37, div36, span10, t99, i10, t100_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6]) )) + "", t100, t101, t102_value = (100*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6])).toFixed(2) + "", t102, t103, t104, div38, span11, t106, i11, t107_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]))) + "", t107, t108, t109, div40, t111, div48, t112, updating_checked_4, t113, div46, div42, t115, div45, div43, span12, t117, i12, t118_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][9])) + "", t118, t119, t120_value = (100*ctx.Iters[ctx.active_][9]).toFixed(2) + "", t120, t121, t122, div44, span13, t124, i13, t125_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[9])) + "", t125, t126, t127, div47, t129, div74, div51, updating_checked_5, updating_active, t130, div52, t131, div53, t132, div61, div60, div54, span14, raw0_value = math_inline("\\mathcal{R}_t=" + (ctx.R0*ctx.InterventionAmt).toFixed(2) ) + "", t133, t134, show_if = ctx.xScaleTime(ctx.InterventionTime) >= 100, t135, div58, div55, t136, t137_value = format("d")(ctx.InterventionTime) + "", t137, t138, span15, div56, t140, div57, svg, g1, g0, path, t141, div59, t142, div69, div68, div67, div66, div63, div62, t143, br1, t144, div65, div64, t145_value = (ctx.InterventionAmt).toFixed(2) + "", t145, t146, input0, t147, div70, t148, div73, div72, updating_checked_6, div71, t150, div117, div79, div76, t152, div77, t153, div78, t155, div116, div85, div80, t157, div81, t158, br2, t159, div82, t160_value = format(",")(ctx.Math.round(ctx.N)) + "", t160, t161, input1, t162, div83, t163, br3, t164, div84, t165, t166, input2, t167, div90, div88, div86, t168, html_tag, raw1_value = math_inline("\\mathcal{R}_0") + "", t169, div87, t170, br4, t171, div89, t172, t173, input3, t174, div96, div91, t176, div92, t177, html_tag_1, raw2_value = math_inline("T_{\\text{inc}}") + "", t178, br5, t179, div93, t180_value = (ctx.D_incbation).toFixed(2) + "", t180, t181, t182, input4, t183, div94, t184, html_tag_2, raw3_value = math_inline("T_{\\text{inf}}") + "", t185, br6, t186, div95, t187, t188, t189, input5, t190, div97, t191, div103, div98, t193, div99, t194, br7, t195, div100, t196_value = (ctx.CFR*100).toFixed(2) + "", t196, t197, t198, input6, t199, div101, t200, br8, t201, div102, t202, t203, t204, input7, input7_min_value, t205, div109, div104, t207, div105, t208, br9, t209, div106, t210, t211, t212, input8, t213, div107, t214, br10, t215, div108, t216, t217, t218, input9, t219, div115, div110, t221, div111, t222, br11, t223, div112, t224_value = (ctx.P_SEVERE*100).toFixed(2) + "", t224, t225, t226, input10, t227, div113, t228, br12, t229, div114, t230, t231, t232, input11, t233, div118, t234, p0, t235, a0, t237, br13, t238, br14, t239, br15, t240, p1, t241, b1, a1, t243, t244, b2, t246, span16, b3, t248, span17, b4, t250, span18, b5, t252, i14, b6, t254, span19, b7, t256, span20, b8, t258, span21, b9, t260, t261, a2, t263, a3, t265, span22, t266, t267, p2, t268, t269_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "", t269, t270, a4, t272, input12, t273, t274_value = ((1-(ctx.Math.pow(1 - (ctx.Iters[ctx.active_][2])*(0.45/100), ctx.p_num_ind)))*100).toFixed(5) + "", t274, t275, a5, t277, t278, p3, t280, div119, table, tr0, th0, t281, th1, t283, th2, t284, br16, t285, html_tag_3, raw5_value = math_inline("\\mathcal{R}_0") + "", t286, th3, t287, br17, t288, html_tag_4, raw6_value = math_inline("T_{\\text{inc}}") + "", t289, t290, th4, t291, br18, t292, html_tag_5, raw7_value = math_inline("T_{\\text{inf}}") + "", t293, t294, tr1, td0, a6, t296, td1, t298, td2, t300, td3, t302, td4, t304, tr2, td5, a7, t306, td6, t308, td7, t310, td8, t312, td9, t314, tr3, td10, a8, t316, td11, t318, td12, t320, td13, t322, td14, t324, tr4, td15, a9, t326, td16, t328, td17, t330, td18, t331, td19, t332, tr5, td20, a10, t334, td21, t336, td22, t338, td23, t340, td24, t341, tr6, td25, a11, t343, td26, t345, td27, t347, td28, t349, td29, t351, tr7, td30, a12, t353, td31, t355, td32, t357, td33, t359, td34, t361, tr8, td35, a13, t363, td36, t365, td37, t366, td38, t368, td39, t369, tr9, td40, a14, t371, td41, t373, td42, t375, td43, t376, td44, t377, tr10, td45, a15, t379, td46, t381, td47, t382, td48, t384, td49, t386, td50, t387, tr11, td51, a16, t389, td52, t391, td53, t393, td54, t394, td55, t395, p4, t396, a17, t398, a18, t400, t401, p5, b10, br19, t403, html_tag_6, raw8_value = math_inline ("I, R") + "", t404, i15, t406, i16, t408, i17, t410, t411, p6, b11, br20, t413, a19, t415, a20, t417, a21, t419, a22, t421, t422, div122, div121, div120, t424, form, textarea, current, dispose;
+
+    	var checkbox0 = new Checkbox({
+    		props: { color: "#CCC" },
+    		$$inline: true
+    	});
+
+    	var arrow0 = new Arrow({ props: { height: "41" }, $$inline: true });
 
     	function checkbox1_checked_binding(value) {
-    		/*checkbox1_checked_binding*/ ctx[63].call(null, value);
+    		ctx.checkbox1_checked_binding.call(null, value);
+    		updating_checked = true;
+    		add_flush_callback(() => updating_checked = false);
     	}
 
-    	let checkbox1_props = { color: /*colors*/ ctx[36][4] };
+    	let checkbox1_props = { color: ctx.colors[4] };
+    	if (ctx.checked[4] !== void 0) {
+    		checkbox1_props.checked = ctx.checked[4];
+    	}
+    	var checkbox1 = new Checkbox({ props: checkbox1_props, $$inline: true });
 
-    	if (/*checked*/ ctx[25][4] !== void 0) {
-    		checkbox1_props.checked = /*checked*/ ctx[25][4];
+    	binding_callbacks.push(() => bind(checkbox1, 'checked', checkbox1_checked_binding));
+
+    	var arrow1 = new Arrow({ props: { height: "41" }, $$inline: true });
+
+    	function checkbox2_checked_binding(value_1) {
+    		ctx.checkbox2_checked_binding.call(null, value_1);
+    		updating_checked_1 = true;
+    		add_flush_callback(() => updating_checked_1 = false);
     	}
 
-    	const checkbox1 = new Checkbox({ props: checkbox1_props, $$inline: true });
-    	binding_callbacks.push(() => bind(checkbox1, "checked", checkbox1_checked_binding));
-    	const arrow1 = new Arrow({ props: { height: "41" }, $$inline: true });
+    	let checkbox2_props = { color: ctx.colors[3] };
+    	if (ctx.checked[3] !== void 0) {
+    		checkbox2_props.checked = ctx.checked[3];
+    	}
+    	var checkbox2 = new Checkbox({ props: checkbox2_props, $$inline: true });
 
-    	function checkbox2_checked_binding(value) {
-    		/*checkbox2_checked_binding*/ ctx[64].call(null, value);
+    	binding_callbacks.push(() => bind(checkbox2, 'checked', checkbox2_checked_binding));
+
+    	var arrow2 = new Arrow({ props: { height: "41" }, $$inline: true });
+
+    	var checkbox3 = new Checkbox({
+    		props: { color: "grey", callback: ctx.func },
+    		$$inline: true
+    	});
+
+    	var arrow3 = new Arrow({
+    		props: {
+    		height: "56",
+    		arrowhead: "",
+    		dasharray: "3 2"
+    	},
+    		$$inline: true
+    	});
+
+    	function checkbox4_checked_binding(value_2) {
+    		ctx.checkbox4_checked_binding.call(null, value_2);
+    		updating_checked_2 = true;
+    		add_flush_callback(() => updating_checked_2 = false);
     	}
 
-    	let checkbox2_props = { color: /*colors*/ ctx[36][3] };
+    	let checkbox4_props = { color: ctx.colors[2] };
+    	if (ctx.checked[2] !== void 0) {
+    		checkbox4_props.checked = ctx.checked[2];
+    	}
+    	var checkbox4 = new Checkbox({ props: checkbox4_props, $$inline: true });
 
-    	if (/*checked*/ ctx[25][3] !== void 0) {
-    		checkbox2_props.checked = /*checked*/ ctx[25][3];
+    	binding_callbacks.push(() => bind(checkbox4, 'checked', checkbox4_checked_binding));
+
+    	var arrow4 = new Arrow({
+    		props: {
+    		height: "23",
+    		arrowhead: "",
+    		dasharray: "3 2"
+    	},
+    		$$inline: true
+    	});
+
+    	var arrow5 = new Arrow({
+    		props: {
+    		height: "43",
+    		arrowhead: "",
+    		dasharray: "3 2"
+    	},
+    		$$inline: true
+    	});
+
+    	function checkbox5_checked_binding(value_3) {
+    		ctx.checkbox5_checked_binding.call(null, value_3);
+    		updating_checked_3 = true;
+    		add_flush_callback(() => updating_checked_3 = false);
     	}
 
-    	const checkbox2 = new Checkbox({ props: checkbox2_props, $$inline: true });
-    	binding_callbacks.push(() => bind(checkbox2, "checked", checkbox2_checked_binding));
-    	const arrow2 = new Arrow({ props: { height: "41" }, $$inline: true });
+    	let checkbox5_props = { color: ctx.colors[1] };
+    	if (ctx.checked[1] !== void 0) {
+    		checkbox5_props.checked = ctx.checked[1];
+    	}
+    	var checkbox5 = new Checkbox({ props: checkbox5_props, $$inline: true });
 
-    	const checkbox3 = new Checkbox({
-    			props: {
-    				color: "grey",
-    				callback: /*func*/ ctx[65]
-    			},
-    			$$inline: true
-    		});
+    	binding_callbacks.push(() => bind(checkbox5, 'checked', checkbox5_checked_binding));
 
-    	const arrow3 = new Arrow({
-    			props: {
-    				height: "56",
-    				arrowhead: "",
-    				dasharray: "3 2"
-    			},
-    			$$inline: true
-    		});
+    	var arrow6 = new Arrow({
+    		props: {
+    		height: "40",
+    		arrowhead: "",
+    		dasharray: "3 2"
+    	},
+    		$$inline: true
+    	});
 
-    	function checkbox4_checked_binding(value) {
-    		/*checkbox4_checked_binding*/ ctx[66].call(null, value);
+    	function checkbox6_checked_binding(value_4) {
+    		ctx.checkbox6_checked_binding.call(null, value_4);
+    		updating_checked_4 = true;
+    		add_flush_callback(() => updating_checked_4 = false);
     	}
 
-    	let checkbox4_props = { color: /*colors*/ ctx[36][2] };
+    	let checkbox6_props = { color: ctx.colors[0] };
+    	if (ctx.checked[0] !== void 0) {
+    		checkbox6_props.checked = ctx.checked[0];
+    	}
+    	var checkbox6 = new Checkbox({ props: checkbox6_props, $$inline: true });
 
-    	if (/*checked*/ ctx[25][2] !== void 0) {
-    		checkbox4_props.checked = /*checked*/ ctx[25][2];
+    	binding_callbacks.push(() => bind(checkbox6, 'checked', checkbox6_checked_binding));
+
+    	function chart_checked_binding(value_5) {
+    		ctx.chart_checked_binding.call(null, value_5);
+    		updating_checked_5 = true;
+    		add_flush_callback(() => updating_checked_5 = false);
     	}
 
-    	const checkbox4 = new Checkbox({ props: checkbox4_props, $$inline: true });
-    	binding_callbacks.push(() => bind(checkbox4, "checked", checkbox4_checked_binding));
-
-    	const arrow4 = new Arrow({
-    			props: {
-    				height: "23",
-    				arrowhead: "",
-    				dasharray: "3 2"
-    			},
-    			$$inline: true
-    		});
-
-    	const arrow5 = new Arrow({
-    			props: {
-    				height: "43",
-    				arrowhead: "",
-    				dasharray: "3 2"
-    			},
-    			$$inline: true
-    		});
-
-    	function checkbox5_checked_binding(value) {
-    		/*checkbox5_checked_binding*/ ctx[67].call(null, value);
-    	}
-
-    	let checkbox5_props = { color: /*colors*/ ctx[36][1] };
-
-    	if (/*checked*/ ctx[25][1] !== void 0) {
-    		checkbox5_props.checked = /*checked*/ ctx[25][1];
-    	}
-
-    	const checkbox5 = new Checkbox({ props: checkbox5_props, $$inline: true });
-    	binding_callbacks.push(() => bind(checkbox5, "checked", checkbox5_checked_binding));
-
-    	const arrow6 = new Arrow({
-    			props: {
-    				height: "40",
-    				arrowhead: "",
-    				dasharray: "3 2"
-    			},
-    			$$inline: true
-    		});
-
-    	function checkbox6_checked_binding(value) {
-    		/*checkbox6_checked_binding*/ ctx[68].call(null, value);
-    	}
-
-    	let checkbox6_props = { color: /*colors*/ ctx[36][0] };
-
-    	if (/*checked*/ ctx[25][0] !== void 0) {
-    		checkbox6_props.checked = /*checked*/ ctx[25][0];
-    	}
-
-    	const checkbox6 = new Checkbox({ props: checkbox6_props, $$inline: true });
-    	binding_callbacks.push(() => bind(checkbox6, "checked", checkbox6_checked_binding));
-
-    	function chart_checked_binding(value) {
-    		/*chart_checked_binding*/ ctx[69].call(null, value);
-    	}
-
-    	function chart_active_binding(value) {
-    		/*chart_active_binding*/ ctx[70].call(null, value);
+    	function chart_active_binding(value_6) {
+    		ctx.chart_active_binding.call(null, value_6);
+    		updating_active = true;
+    		add_flush_callback(() => updating_active = false);
     	}
 
     	let chart_props = {
-    		y: /*P*/ ctx[17],
-    		xmax: /*Xmax*/ ctx[14],
-    		total_infected: /*total_infected*/ ctx[22],
-    		deaths: /*deaths*/ ctx[20],
-    		total: /*total*/ ctx[21],
-    		timestep: /*timestep*/ ctx[18],
-    		tmax: /*tmax*/ ctx[19],
-    		N: /*N*/ ctx[3],
-    		ymax: /*lock*/ ctx[26] ? /*Plock*/ ctx[0] : /*Pmax*/ ctx[24],
-    		InterventionTime: /*InterventionTime*/ ctx[12],
-    		colors: /*colors*/ ctx[36],
-    		log: !/*log*/ ctx[35]
+    		y: ctx.P,
+    		xmax: ctx.Xmax,
+    		total_infected: ctx.total_infected,
+    		deaths: ctx.deaths,
+    		total: ctx.total,
+    		timestep: ctx.timestep,
+    		tmax: ctx.tmax,
+    		N: ctx.N,
+    		ymax: ctx.lock ? ctx.Plock: ctx.Pmax,
+    		InterventionTime: ctx.InterventionTime,
+    		colors: ctx.colors,
+    		log: !ctx.log
     	};
-
-    	if (/*checked*/ ctx[25] !== void 0) {
-    		chart_props.checked = /*checked*/ ctx[25];
+    	if (ctx.checked !== void 0) {
+    		chart_props.checked = ctx.checked;
     	}
-
-    	if (/*active*/ ctx[29] !== void 0) {
-    		chart_props.active = /*active*/ ctx[29];
+    	if (ctx.active !== void 0) {
+    		chart_props.active = ctx.active;
     	}
+    	var chart = new Chart({ props: chart_props, $$inline: true });
 
-    	const chart = new Chart({ props: chart_props, $$inline: true });
-    	binding_callbacks.push(() => bind(chart, "checked", chart_checked_binding));
-    	binding_callbacks.push(() => bind(chart, "active", chart_active_binding));
-    	let if_block = show_if && create_if_block$1(ctx);
-    	let each_value = /*milestones*/ ctx[34];
-    	validate_each_argument(each_value);
+    	binding_callbacks.push(() => bind(chart, 'checked', chart_checked_binding));
+    	binding_callbacks.push(() => bind(chart, 'active', chart_active_binding));
+
+    	var if_block = (show_if) && create_if_block$1(ctx);
+
+    	let each_value = ctx.milestones;
+
     	let each_blocks = [];
 
     	for (let i = 0; i < each_value.length; i += 1) {
@@ -23761,18 +22737,19 @@
     		each_blocks[i] = null;
     	});
 
-    	function checkbox7_checked_binding(value) {
-    		/*checkbox7_checked_binding*/ ctx[72].call(null, value);
+    	function checkbox7_checked_binding(value_7) {
+    		ctx.checkbox7_checked_binding.call(null, value_7);
+    		updating_checked_6 = true;
+    		add_flush_callback(() => updating_checked_6 = false);
     	}
 
     	let checkbox7_props = { color: "#CCC" };
-
-    	if (/*log*/ ctx[35] !== void 0) {
-    		checkbox7_props.checked = /*log*/ ctx[35];
+    	if (ctx.log !== void 0) {
+    		checkbox7_props.checked = ctx.log;
     	}
+    	var checkbox7 = new Checkbox({ props: checkbox7_props, $$inline: true });
 
-    	const checkbox7 = new Checkbox({ props: checkbox7_props, $$inline: true });
-    	binding_callbacks.push(() => bind(checkbox7, "checked", checkbox7_checked_binding));
+    	binding_callbacks.push(() => bind(checkbox7, 'checked', checkbox7_checked_binding));
 
     	const block = {
     		c: function create() {
@@ -23786,16 +22763,16 @@
     			div49 = element("div");
     			div0 = element("div");
     			b0 = element("b");
-    			b0.textContent = "Day";
+    			b0.textContent = "Dia";
     			br0 = element("br");
     			t4 = space();
     			t5 = text(t5_value);
     			t6 = space();
     			div7 = element("div");
     			span0 = element("span");
-    			create_component(checkbox0.$$.fragment);
+    			checkbox0.$$.fragment.c();
     			t7 = space();
-    			create_component(arrow0.$$.fragment);
+    			arrow0.$$.fragment.c();
     			t8 = space();
     			div5 = element("div");
     			div1 = element("div");
@@ -23818,19 +22795,19 @@
     			t19 = space();
     			i1 = element("i");
     			t20 = text(t20_value);
-    			t21 = text(" / day");
+    			t21 = text(" / dia");
     			t22 = space();
     			div6 = element("div");
     			div6.textContent = "População não imune a doença.";
     			t24 = space();
     			div14 = element("div");
-    			create_component(checkbox1.$$.fragment);
+    			checkbox1.$$.fragment.c();
     			t25 = space();
-    			create_component(arrow1.$$.fragment);
+    			arrow1.$$.fragment.c();
     			t26 = space();
     			div12 = element("div");
     			div8 = element("div");
-    			div8.textContent = "Exposed";
+    			div8.textContent = "Exposto";
     			t28 = space();
     			div11 = element("div");
     			div9 = element("div");
@@ -23855,9 +22832,9 @@
     			div13.textContent = "População atualmente incubada.";
     			t42 = space();
     			div21 = element("div");
-    			create_component(checkbox2.$$.fragment);
+    			checkbox2.$$.fragment.c();
     			t43 = space();
-    			create_component(arrow2.$$.fragment);
+    			arrow2.$$.fragment.c();
     			t44 = space();
     			div19 = element("div");
     			div15 = element("div");
@@ -23889,9 +22866,9 @@
     			t61 = text(" circulando.");
     			t62 = space();
     			div28 = element("div");
-    			create_component(checkbox3.$$.fragment);
+    			checkbox3.$$.fragment.c();
     			t63 = space();
-    			create_component(arrow3.$$.fragment);
+    			arrow3.$$.fragment.c();
     			t64 = space();
     			div26 = element("div");
     			div22 = element("div");
@@ -23920,9 +22897,9 @@
     			div27.textContent = "População não mais infectada por isolamento ou imunidade.";
     			t80 = space();
     			div34 = element("div");
-    			create_component(checkbox4.$$.fragment);
+    			checkbox4.$$.fragment.c();
     			t81 = space();
-    			create_component(arrow4.$$.fragment);
+    			arrow4.$$.fragment.c();
     			t82 = space();
     			div32 = element("div");
     			div29 = element("div");
@@ -23943,9 +22920,9 @@
     			div33.textContent = "Totalmente Recuperados.";
     			t93 = space();
     			div41 = element("div");
-    			create_component(arrow5.$$.fragment);
+    			arrow5.$$.fragment.c();
     			t94 = space();
-    			create_component(checkbox5.$$.fragment);
+    			checkbox5.$$.fragment.c();
     			t95 = space();
     			div39 = element("div");
     			div35 = element("div");
@@ -23974,9 +22951,9 @@
     			div40.textContent = "Hospitalizações ativas.";
     			t111 = space();
     			div48 = element("div");
-    			create_component(arrow6.$$.fragment);
+    			arrow6.$$.fragment.c();
     			t112 = space();
-    			create_component(checkbox6.$$.fragment);
+    			checkbox6.$$.fragment.c();
     			t113 = space();
     			div46 = element("div");
     			div42 = element("div");
@@ -24006,7 +22983,7 @@
     			t129 = space();
     			div74 = element("div");
     			div51 = element("div");
-    			create_component(chart.$$.fragment);
+    			chart.$$.fragment.c();
     			t130 = space();
     			div52 = element("div");
     			t131 = space();
@@ -24061,7 +23038,7 @@
     			t148 = space();
     			div73 = element("div");
     			div72 = element("div");
-    			create_component(checkbox7.$$.fragment);
+    			checkbox7.$$.fragment.c();
     			div71 = element("div");
     			div71.textContent = "escala linear";
     			t150 = space();
@@ -24094,7 +23071,7 @@
     			br3 = element("br");
     			t164 = space();
     			div84 = element("div");
-    			t165 = text(/*I0*/ ctx[4]);
+    			t165 = text(ctx.I0);
     			t166 = space();
     			input2 = element("input");
     			t167 = space();
@@ -24108,7 +23085,7 @@
     			br4 = element("br");
     			t171 = space();
     			div89 = element("div");
-    			t172 = text(/*R0*/ ctx[5]);
+    			t172 = text(ctx.R0);
     			t173 = space();
     			input3 = element("input");
     			t174 = space();
@@ -24133,8 +23110,8 @@
     			br6 = element("br");
     			t186 = space();
     			div95 = element("div");
-    			t187 = text(/*D_infectious*/ ctx[7]);
-    			t188 = text(" Days");
+    			t187 = text(ctx.D_infectious);
+    			t188 = text(" Dias");
     			t189 = space();
     			input5 = element("input");
     			t190 = space();
@@ -24159,7 +23136,7 @@
     			br8 = element("br");
     			t201 = space();
     			div102 = element("div");
-    			t202 = text(/*Time_to_death*/ ctx[1]);
+    			t202 = text(ctx.Time_to_death);
     			t203 = text(" Dias");
     			t204 = space();
     			input7 = element("input");
@@ -24173,8 +23150,8 @@
     			br9 = element("br");
     			t209 = space();
     			div106 = element("div");
-    			t210 = text(/*D_recovery_severe*/ ctx[9]);
-    			t211 = text(" Days");
+    			t210 = text(ctx.D_recovery_severe);
+    			t211 = text(" Dias");
     			t212 = space();
     			input8 = element("input");
     			t213 = space();
@@ -24183,7 +23160,7 @@
     			br10 = element("br");
     			t215 = space();
     			div108 = element("div");
-    			t216 = text(/*D_recovery_mild*/ ctx[8]);
+    			t216 = text(ctx.D_recovery_mild);
     			t217 = text(" Dias");
     			t218 = space();
     			input9 = element("input");
@@ -24207,7 +23184,7 @@
     			br12 = element("br");
     			t229 = space();
     			div114 = element("div");
-    			t230 = text(/*D_hospital_lag*/ ctx[10]);
+    			t230 = text(ctx.D_hospital_lag);
     			t231 = text(" Dias");
     			t232 = space();
     			input11 = element("input");
@@ -24215,326 +23192,334 @@
     			div118 = element("div");
     			t234 = space();
     			p0 = element("p");
-    			t235 = text("No momento da redação deste artigo, a doença de coronavírus de 2019 continua sendo uma crise global de saúde de magnitude séria e incerta. Para o não especialista (como eu), contextualizar os números, previsões e parâmetros epidemiológicos descritos na mídia e na literatura pode ser um desafio. Criei esta calculadora como uma tentativa de abordar essa lacuna no entendimento.");
-    			br13 = element("br");
-    			t236 = text("\nAutor: https://github.com/gabgoh");
-    			br14 = element("br");
-    			t237 = text("\nAdaptação: https://github.com/BrenoMazieiro");
-    			br15 = element("br");
-    			t238 = space();
-    			p1 = element("p");
-    			t239 = text("Esta calculadora implementa um modelo clássico de doença infecciosa — ");
-    			b1 = element("b");
+    			t235 = text("Esta excelente calculadora Epidêmica desenvolvida por Gabriel Goh (");
     			a0 = element("a");
-    			a0.textContent = "SEIR";
-    			t241 = space();
-    			t242 = text("(");
+    			a0.textContent = "http://gabgoh.github.io/";
+    			t237 = text(") e colaboradores esta sendo disponibilizada para servir como ferramenta de testes para o cenário brasileiro. Como é muito bem colocado na versão original deste trabalho para o não especialista, contextualizar os números, previsões e parâmetros epidemiológicos descritos na mídia e na literatura pode ser um desafio. Assim, essa calculadora foi criada como uma tentativa de abordar essa lacuna no entendimento. O nosso grupo esta trabalhando para, a partir dessa inciativa, carregar outros modelos que podem vir a ser uteis para a análise dos casos no Brasil.");
+    			br13 = element("br");
+    			t238 = text("\nAutor: https://github.com/gabgoh");
+    			br14 = element("br");
+    			t239 = text("\nAdaptação: https://github.com/BrenoMazieiro");
+    			br15 = element("br");
+    			t240 = space();
+    			p1 = element("p");
+    			t241 = text("Esta calculadora implementa um modelo clássico de doença infecciosa — ");
+    			b1 = element("b");
+    			a1 = element("a");
+    			a1.textContent = "SEIR";
+    			t243 = space();
+    			t244 = text("(");
     			b2 = element("b");
     			b2.textContent = "S";
-    			t244 = text("usceptible → ");
+    			t246 = text("uscetível → ");
     			span16 = element("span");
     			b3 = element("b");
     			b3.textContent = "E";
-    			t246 = text("xposed → ");
+    			t248 = text("xposto → ");
     			span17 = element("span");
     			b4 = element("b");
     			b4.textContent = "I";
-    			t248 = text("nfected → ");
+    			t250 = text("nfectado → ");
     			span18 = element("span");
     			b5 = element("b");
     			b5.textContent = "R";
-    			t250 = text("emoved), um modelo idealizado de propagação ainda usado nas linhas de frente da pesquisa como em: [");
-    			a1 = element("a");
-    			a1.textContent = "Wu, et. al";
-    			t252 = text(", ");
-    			a2 = element("a");
-    			a2.textContent = "Kucharski et. al";
-    			t254 = text("]. A dinâmica deste modelo é caracterizada por um conjunto de quatro equações diferenciais ordinárias que correspondem aos estágios da progressão da doença:\n");
+    			t252 = text("ecuperado ,do inglês: ");
+    			i14 = element("i");
+    			b6 = element("b");
+    			b6.textContent = "S";
+    			t254 = text("usceptible → ");
     			span19 = element("span");
-    			t255 = text("\nAlém da dinâmica de transmissão, este modelo permite o uso de informações suplementares de tempo para modelar a taxa de mortalidade e a carga de assistência médica.");
-    			t256 = space();
-    			p2 = element("p");
-    			t257 = text("Observe que alguém pode usar esta calculadora para medir a exposição ao risco da doença em qualquer dia da epidemia: a probabilidade de ser infectado no dia ");
-    			t258 = text(t258_value);
-    			t259 = text(" dado ");
+    			b7 = element("b");
+    			b7.textContent = "E";
+    			t256 = text("xposed → ");
+    			span20 = element("span");
+    			b8 = element("b");
+    			b8.textContent = "I";
+    			t258 = text("nfected → ");
+    			span21 = element("span");
+    			b9 = element("b");
+    			b9.textContent = "R";
+    			t260 = text("ecovered");
+    			t261 = text("), um modelo idealizado de propagação ainda usado nas linhas de frente da pesquisa como em: [");
+    			a2 = element("a");
+    			a2.textContent = "Wu, et. al";
+    			t263 = text(", ");
     			a3 = element("a");
-    			a3.textContent = "contato próximo";
-    			t261 = text(" com ");
-    			input12 = element("input");
-    			t262 = text(" individuos é ");
-    			t263 = text(t263_value);
-    			t264 = text("% dada uma taxa de ataque de 0,45% [");
-    			a4 = element("a");
-    			a4.textContent = "Burke et. al";
-    			t266 = text("].");
+    			a3.textContent = "Kucharski et. al";
+    			t265 = text("]. A dinâmica deste modelo é caracterizada por um conjunto de quatro equações diferenciais ordinárias que correspondem aos estágios da progressão da doença:\n");
+    			span22 = element("span");
+    			t266 = text("\nAlém da dinâmica de transmissão, este modelo permite o uso de informações suplementares de tempo para modelar a taxa de mortalidade e a carga de assistência médica.");
     			t267 = space();
+    			p2 = element("p");
+    			t268 = text("Observe que alguém pode usar esta calculadora para medir a exposição ao risco da doença em qualquer dia da epidemia: a probabilidade de ser infectado no dia ");
+    			t269 = text(t269_value);
+    			t270 = text(" dado ");
+    			a4 = element("a");
+    			a4.textContent = "contato próximo";
+    			t272 = text(" com ");
+    			input12 = element("input");
+    			t273 = text(" individuos é ");
+    			t274 = text(t274_value);
+    			t275 = text("% dada uma taxa de ataque de 0,45% [");
+    			a5 = element("a");
+    			a5.textContent = "Burke et. al";
+    			t277 = text("].");
+    			t278 = space();
     			p3 = element("p");
     			p3.textContent = "Uma amostra das estimativas para parâmetros epidêmicos é apresentada abaixo:";
-    			t269 = space();
+    			t280 = space();
     			div119 = element("div");
     			table = element("table");
     			tr0 = element("tr");
     			th0 = element("th");
-    			t270 = space();
+    			t281 = space();
     			th1 = element("th");
     			th1.textContent = "Local";
-    			t272 = space();
-    			th2 = element("th");
-    			t273 = text("Número de reprodução");
-    			br16 = element("br");
-    			t274 = space();
-    			t275 = space();
-    			th3 = element("th");
-    			t276 = text("Período de incubação");
-    			br17 = element("br");
-    			t277 = space();
-    			t278 = text(" (em dias)");
-    			t279 = space();
-    			th4 = element("th");
-    			t280 = text("Período de infecção");
-    			br18 = element("br");
-    			t281 = space();
-    			t282 = text(" (em dias)");
     			t283 = space();
+    			th2 = element("th");
+    			t284 = text("Número de reprodução");
+    			br16 = element("br");
+    			t285 = space();
+    			t286 = space();
+    			th3 = element("th");
+    			t287 = text("Período de incubação");
+    			br17 = element("br");
+    			t288 = space();
+    			t289 = text(" (em dias)");
+    			t290 = space();
+    			th4 = element("th");
+    			t291 = text("Período de infecção");
+    			br18 = element("br");
+    			t292 = space();
+    			t293 = text(" (em dias)");
+    			t294 = space();
     			tr1 = element("tr");
     			td0 = element("td");
-    			a5 = element("a");
-    			a5.textContent = "Kucharski et. al";
-    			t285 = space();
+    			a6 = element("a");
+    			a6.textContent = "Kucharski et. al";
+    			t296 = space();
     			td1 = element("td");
     			td1.textContent = "Wuhan";
-    			t287 = space();
+    			t298 = space();
     			td2 = element("td");
     			td2.textContent = "3.0 (1.5 — 4.5)";
-    			t289 = space();
+    			t300 = space();
     			td3 = element("td");
     			td3.textContent = "5.2";
-    			t291 = space();
+    			t302 = space();
     			td4 = element("td");
     			td4.textContent = "2.9";
-    			t293 = space();
+    			t304 = space();
     			tr2 = element("tr");
     			td5 = element("td");
-    			a6 = element("a");
-    			a6.textContent = "Li, Leung and Leung";
-    			t295 = space();
+    			a7 = element("a");
+    			a7.textContent = "Li, Leung and Leung";
+    			t306 = space();
     			td6 = element("td");
     			td6.textContent = "Wuhan";
-    			t297 = space();
+    			t308 = space();
     			td7 = element("td");
     			td7.textContent = "2.2 (1.4 — 3.9)";
-    			t299 = space();
+    			t310 = space();
     			td8 = element("td");
     			td8.textContent = "5.2 (4.1 — 7.0)";
-    			t301 = space();
+    			t312 = space();
     			td9 = element("td");
     			td9.textContent = "2.3 (0.0 — 14.9)";
-    			t303 = space();
+    			t314 = space();
     			tr3 = element("tr");
     			td10 = element("td");
-    			a7 = element("a");
-    			a7.textContent = "Wu et. al";
-    			t305 = space();
+    			a8 = element("a");
+    			a8.textContent = "Wu et. al";
+    			t316 = space();
     			td11 = element("td");
     			td11.textContent = "Greater Wuhan";
-    			t307 = space();
+    			t318 = space();
     			td12 = element("td");
     			td12.textContent = "2.68 (2.47 — 2.86)";
-    			t309 = space();
+    			t320 = space();
     			td13 = element("td");
     			td13.textContent = "6.1";
-    			t311 = space();
+    			t322 = space();
     			td14 = element("td");
     			td14.textContent = "2.3";
-    			t313 = space();
+    			t324 = space();
     			tr4 = element("tr");
     			td15 = element("td");
-    			a8 = element("a");
-    			a8.textContent = "WHO Initial Estimate";
-    			t315 = space();
+    			a9 = element("a");
+    			a9.textContent = "WHO Initial Estimate";
+    			t326 = space();
     			td16 = element("td");
     			td16.textContent = "Hubei";
-    			t317 = space();
+    			t328 = space();
     			td17 = element("td");
     			td17.textContent = "1.95 (1.4 — 2.5)";
-    			t319 = space();
+    			t330 = space();
     			td18 = element("td");
-    			t320 = space();
+    			t331 = space();
     			td19 = element("td");
-    			t321 = space();
+    			t332 = space();
     			tr5 = element("tr");
     			td20 = element("td");
-    			a9 = element("a");
-    			a9.textContent = "WHO-China Joint Mission";
-    			t323 = space();
+    			a10 = element("a");
+    			a10.textContent = "WHO-China Joint Mission";
+    			t334 = space();
     			td21 = element("td");
     			td21.textContent = "Hubei";
-    			t325 = space();
+    			t336 = space();
     			td22 = element("td");
     			td22.textContent = "2.25 (2.0 — 2.5)";
-    			t327 = space();
+    			t338 = space();
     			td23 = element("td");
     			td23.textContent = "5.5 (5.0 - 6.0)";
-    			t329 = space();
+    			t340 = space();
     			td24 = element("td");
-    			t330 = space();
+    			t341 = space();
     			tr6 = element("tr");
     			td25 = element("td");
-    			a10 = element("a");
-    			a10.textContent = "Liu et. al";
-    			t332 = space();
+    			a11 = element("a");
+    			a11.textContent = "Liu et. al";
+    			t343 = space();
     			td26 = element("td");
     			td26.textContent = "Guangdong";
-    			t334 = space();
+    			t345 = space();
     			td27 = element("td");
     			td27.textContent = "4.5 (4.4 — 4.6)";
-    			t336 = space();
+    			t347 = space();
     			td28 = element("td");
     			td28.textContent = "4.8 (2.2 — 7.4)";
-    			t338 = space();
+    			t349 = space();
     			td29 = element("td");
     			td29.textContent = "2.9 (0 — 5.9)";
-    			t340 = space();
+    			t351 = space();
     			tr7 = element("tr");
     			td30 = element("td");
-    			a11 = element("a");
-    			a11.textContent = "Rocklöv, Sjödin and Wilder-Smith";
-    			t342 = space();
+    			a12 = element("a");
+    			a12.textContent = "Rocklöv, Sjödin and Wilder-Smith";
+    			t353 = space();
     			td31 = element("td");
     			td31.textContent = "Princess Diamond";
-    			t344 = space();
+    			t355 = space();
     			td32 = element("td");
     			td32.textContent = "14.8";
-    			t346 = space();
+    			t357 = space();
     			td33 = element("td");
     			td33.textContent = "5.0";
-    			t348 = space();
+    			t359 = space();
     			td34 = element("td");
     			td34.textContent = "10.0";
-    			t350 = space();
+    			t361 = space();
     			tr8 = element("tr");
     			td35 = element("td");
-    			a12 = element("a");
-    			a12.textContent = "Backer, Klinkenberg, Wallinga";
-    			t352 = space();
+    			a13 = element("a");
+    			a13.textContent = "Backer, Klinkenberg, Wallinga";
+    			t363 = space();
     			td36 = element("td");
     			td36.textContent = "Wuhan";
-    			t354 = space();
+    			t365 = space();
     			td37 = element("td");
-    			t355 = space();
+    			t366 = space();
     			td38 = element("td");
     			td38.textContent = "6.5 (5.6 — 7.9)";
-    			t357 = space();
+    			t368 = space();
     			td39 = element("td");
-    			t358 = space();
+    			t369 = space();
     			tr9 = element("tr");
     			td40 = element("td");
-    			a13 = element("a");
-    			a13.textContent = "Read et. al";
-    			t360 = space();
+    			a14 = element("a");
+    			a14.textContent = "Read et. al";
+    			t371 = space();
     			td41 = element("td");
     			td41.textContent = "Wuhan";
-    			t362 = space();
+    			t373 = space();
     			td42 = element("td");
     			td42.textContent = "3.11 (2.39 — 4.13)";
-    			t364 = space();
+    			t375 = space();
     			td43 = element("td");
-    			t365 = space();
+    			t376 = space();
     			td44 = element("td");
-    			t366 = space();
+    			t377 = space();
     			tr10 = element("tr");
     			td45 = element("td");
-    			a14 = element("a");
-    			a14.textContent = "Bi et. al";
-    			t368 = space();
+    			a15 = element("a");
+    			a15.textContent = "Bi et. al";
+    			t379 = space();
     			td46 = element("td");
     			td46.textContent = "Shenzhen";
-    			t370 = space();
+    			t381 = space();
     			td47 = element("td");
-    			t371 = space();
+    			t382 = space();
     			td48 = element("td");
     			td48.textContent = "4.8 (4.2 — 5.4)";
-    			t373 = space();
+    			t384 = space();
     			td49 = element("td");
     			td49.textContent = "1.5 (0 — 3.4)";
-    			t375 = space();
+    			t386 = space();
     			td50 = element("td");
-    			t376 = space();
+    			t387 = space();
     			tr11 = element("tr");
     			td51 = element("td");
-    			a15 = element("a");
-    			a15.textContent = "Tang et. al";
-    			t378 = space();
+    			a16 = element("a");
+    			a16.textContent = "Tang et. al";
+    			t389 = space();
     			td52 = element("td");
     			td52.textContent = "China";
-    			t380 = space();
+    			t391 = space();
     			td53 = element("td");
     			td53.textContent = "6.47 (5.71 — 7.23)";
-    			t382 = space();
+    			t393 = space();
     			td54 = element("td");
-    			t383 = space();
+    			t394 = space();
     			td55 = element("td");
-    			t384 = space();
+    			t395 = space();
     			p4 = element("p");
-    			t385 = text("Veja em [");
-    			a16 = element("a");
-    			a16.textContent = "Liu et. al";
-    			t387 = text("] o levantamento detalhado das estimativas atuais do número de reprodução. Os parâmetros para as características clínicas das doenças são obtidos a partir dos seguintes ");
+    			t396 = text("Veja em [");
     			a17 = element("a");
-    			a17.textContent = "WHO Report";
-    			t389 = text(".");
-    			t390 = space();
-    			p5 = element("p");
-    			t391 = text("Please DM me feedback ");
+    			a17.textContent = "Liu et. al";
+    			t398 = text("] o levantamento detalhado das estimativas atuais do número de reprodução. Os parâmetros para as características clínicas das doenças são obtidos a partir dos seguintes ");
     			a18 = element("a");
-    			a18.textContent = "here";
-    			t393 = text(" or email me ");
-    			a19 = element("a");
-    			a19.textContent = "here";
-    			t395 = text(". My ");
-    			a20 = element("a");
-    			a20.textContent = "website";
-    			t397 = text(".");
-    			t398 = space();
-    			p6 = element("p");
-    			b6 = element("b");
-    			b6.textContent = "Detalhes do modelo ";
+    			a18.textContent = "WHO Report";
+    			t400 = text(".");
+    			t401 = space();
+    			p5 = element("p");
+    			b10 = element("b");
+    			b10.textContent = "Detalhes do modelo ";
     			br19 = element("br");
-    			t400 = text("\nA dinâmica clínica desse modelo é uma elaboração do SEIR que simula a progressão da doença em uma resolução mais alta, subdividindo ");
-    			t401 = text(" em ");
-    			i14 = element("i");
-    			i14.textContent = "leve";
-    			t403 = text(" (pacientes que se recuperam sem a necessidade para hospitalização), ");
+    			t403 = text("\nA dinâmica clínica desse modelo é uma elaboração do SEIR que simula a progressão da doença em uma resolução mais alta, subdividindo ");
+    			t404 = text(" em ");
     			i15 = element("i");
-    			i15.textContent = "moderado";
-    			t405 = text(" (pacientes que necessitam de hospitalização, mas sobrevivem) e ");
+    			i15.textContent = "leve";
+    			t406 = text(" (pacientes que se recuperam sem a necessidade para hospitalização), ");
     			i16 = element("i");
-    			i16.textContent = "fatal";
-    			t407 = text(" (pacientes que necessitam de hospitalização e não sobrevivem). Cada uma dessas variáveis segue sua própria trajetória até o resultado final e a soma desses compartimentos soma os valores previstos pelo SEIR. Por favor, consulte o código fonte para obter detalhes. Observe que assumimos, por simplicidade, que todas as mortes são provenientes de hospitais e que todos os casos fatais são admitidos em hospitais imediatamente após o período infeccioso.");
-    			t408 = space();
-    			p7 = element("p");
-    			b7 = element("b");
-    			b7.textContent = "Agradecimentos ";
+    			i16.textContent = "moderado";
+    			t408 = text(" (pacientes que necessitam de hospitalização, mas sobrevivem) e ");
+    			i17 = element("i");
+    			i17.textContent = "fatal";
+    			t410 = text(" (pacientes que necessitam de hospitalização e não sobrevivem). Cada uma dessas variáveis segue sua própria trajetória até o resultado final e a soma desses compartimentos soma os valores previstos pelo SEIR. Por favor, consulte o código fonte para obter detalhes. Observe que assumimos, por simplicidade, que todas as mortes são provenientes de hospitais e que todos os casos fatais são admitidos em hospitais imediatamente após o período infeccioso.");
+    			t411 = space();
+    			p6 = element("p");
+    			b11 = element("b");
+    			b11.textContent = "Agradecimentos ";
     			br20 = element("br");
-    			t410 = space();
+    			t413 = space();
+    			a19 = element("a");
+    			a19.textContent = "Steven De Keninck";
+    			t415 = text(" pelo RK4 Integrator. ");
+    			a20 = element("a");
+    			a20.textContent = "Chris Olah";
+    			t417 = text(", ");
     			a21 = element("a");
-    			a21.textContent = "Steven De Keninck";
-    			t412 = text(" for RK4 Integrator. ");
+    			a21.textContent = "Shan Carter";
+    			t419 = text(" e ");
     			a22 = element("a");
-    			a22.textContent = "Chris Olah";
-    			t414 = text(", ");
-    			a23 = element("a");
-    			a23.textContent = "Shan Carter";
-    			t416 = text(" and ");
-    			a24 = element("a");
-    			a24.textContent = "Ludwig Schubert";
-    			t418 = text(" wonderful feedback. Charlie Huang for context and discussion.");
-    			t419 = space();
+    			a22.textContent = "Ludwig Schubert";
+    			t421 = text(" pelo maravilhoso feedback. Charlie Huang pela contextualização e discussão.");
+    			t422 = space();
     			div122 = element("div");
     			div121 = element("div");
     			div120 = element("div");
     			div120.textContent = "Parametros de Exportação:";
-    			t421 = space();
+    			t424 = space();
     			form = element("form");
     			textarea = element("textarea");
     			attr_dev(link, "rel", "stylesheet");
@@ -24625,7 +23610,7 @@
     			add_location(div13, file$3, 635, 8, 19019);
     			set_style(div14, "position", "absolute");
     			set_style(div14, "left", "0px");
-    			set_style(div14, "top", legendheight * 1 + "px");
+    			set_style(div14, "top", "" + legendheight*1 + "px");
     			set_style(div14, "width", "180px");
     			set_style(div14, "height", "100px");
     			add_location(div14, file$3, 620, 6, 18165);
@@ -24661,7 +23646,7 @@
     			add_location(div20, file$3, 654, 8, 20060);
     			set_style(div21, "position", "absolute");
     			set_style(div21, "left", "0px");
-    			set_style(div21, "top", legendheight * 2 + "px");
+    			set_style(div21, "top", "" + legendheight*2 + "px");
     			set_style(div21, "width", "180px");
     			set_style(div21, "height", "100px");
     			add_location(div21, file$3, 640, 6, 19207);
@@ -24696,7 +23681,7 @@
     			add_location(div27, file$3, 674, 8, 21349);
     			set_style(div28, "position", "absolute");
     			set_style(div28, "left", "0px");
-    			set_style(div28, "top", legendheight * 3 + "px");
+    			set_style(div28, "top", "" + legendheight*3 + "px");
     			set_style(div28, "width", "180px");
     			set_style(div28, "height", "100px");
     			add_location(div28, file$3, 660, 6, 20268);
@@ -24724,7 +23709,7 @@
     			add_location(div33, file$3, 690, 8, 22281);
     			set_style(div34, "position", "absolute");
     			set_style(div34, "left", "0px");
-    			set_style(div34, "top", legendheight * 4 + 14 - 3 + "px");
+    			set_style(div34, "top", "" + (legendheight*4+14-3) + "px");
     			set_style(div34, "width", "180px");
     			set_style(div34, "height", "100px");
     			add_location(div34, file$3, 679, 6, 21564);
@@ -24759,7 +23744,7 @@
     			add_location(div40, file$3, 707, 8, 23411);
     			set_style(div41, "position", "absolute");
     			set_style(div41, "left", "0px");
-    			set_style(div41, "top", legendheight * 4 + 57 + "px");
+    			set_style(div41, "top", "" + (legendheight*4+57) + "px");
     			set_style(div41, "width", "180px");
     			set_style(div41, "height", "100px");
     			add_location(div41, file$3, 695, 6, 22466);
@@ -24794,7 +23779,7 @@
     			add_location(div47, file$3, 725, 8, 24467);
     			set_style(div48, "position", "absolute");
     			set_style(div48, "left", "0px");
-    			set_style(div48, "top", legendheight * 4 + 120 + 2 + "px");
+    			set_style(div48, "top", "" + (legendheight*4 + 120+2) + "px");
     			set_style(div48, "width", "180px");
     			set_style(div48, "height", "100px");
     			add_location(div48, file$3, 711, 6, 23569);
@@ -24812,9 +23797,9 @@
     			attr_dev(div52, "id", "xAxisDrag");
     			set_style(div52, "pointer-events", "all");
     			set_style(div52, "position", "absolute");
-    			set_style(div52, "top", /*height*/ ctx[40] + 80 + "px");
-    			set_style(div52, "left", 0 + "px");
-    			set_style(div52, "width", 780 + "px");
+    			set_style(div52, "top", "" + (height$1+80) + "px");
+    			set_style(div52, "left", "" + 0 + "px");
+    			set_style(div52, "width", "" + 780 + "px");
     			set_style(div52, "background-color", "#222");
     			set_style(div52, "opacity", "0");
     			set_style(div52, "height", "25px");
@@ -24823,9 +23808,9 @@
     			attr_dev(div53, "id", "yAxisDrag");
     			set_style(div53, "pointer-events", "all");
     			set_style(div53, "position", "absolute");
-    			set_style(div53, "top", 55 + "px");
-    			set_style(div53, "left", 0 + "px");
-    			set_style(div53, "width", 20 + "px");
+    			set_style(div53, "top", "" + 55 + "px");
+    			set_style(div53, "left", "" + 0 + "px");
+    			set_style(div53, "width", "" + 20 + "px");
     			set_style(div53, "background-color", "#222");
     			set_style(div53, "opacity", "0");
     			set_style(div53, "height", "425px");
@@ -24892,22 +23877,18 @@
     			set_style(div60, "pointer-events", "all");
     			set_style(div60, "position", "absolute");
     			set_style(div60, "top", "-38px");
-    			set_style(div60, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
-
-    			set_style(div60, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
-    			? "visible"
-    			: "hidden");
-
+    			set_style(div60, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
+    			set_style(div60, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
     			set_style(div60, "width", "2px");
     			set_style(div60, "background-color", "#FFF");
     			set_style(div60, "border-right", "1px dashed black");
     			set_style(div60, "pointer-events", "all");
     			set_style(div60, "cursor", "col-resize");
-    			set_style(div60, "height", /*height*/ ctx[40] + 19 + "px");
+    			set_style(div60, "height", "" + (height$1+19) + "px");
     			add_location(div60, file$3, 775, 8, 26125);
     			set_style(div61, "position", "absolute");
-    			set_style(div61, "width", /*width*/ ctx[39] + 15 + "px");
-    			set_style(div61, "height", /*height*/ ctx[40] + "px");
+    			set_style(div61, "width", "" + (width$1+15) + "px");
+    			set_style(div61, "height", "" + height$1 + "px");
     			set_style(div61, "position", "absolute");
     			set_style(div61, "top", "100px");
     			set_style(div61, "left", "10px");
@@ -24947,21 +23928,17 @@
     			add_location(div67, file$3, 833, 12, 28905);
     			set_style(div68, "position", "absolute");
     			set_style(div68, "top", "-38px");
-    			set_style(div68, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
-
-    			set_style(div68, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
-    			? "visible"
-    			: "hidden");
-
+    			set_style(div68, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
+    			set_style(div68, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
     			set_style(div68, "width", "2px");
     			set_style(div68, "background-color", "#FFF");
     			set_style(div68, "border-right", "1px dashed black");
     			set_style(div68, "cursor", "col-resize");
-    			set_style(div68, "height", /*height*/ ctx[40] + "px");
+    			set_style(div68, "height", "" + height$1 + "px");
     			add_location(div68, file$3, 823, 8, 28504);
     			set_style(div69, "position", "absolute");
-    			set_style(div69, "width", /*width*/ ctx[39] + 15 + "px");
-    			set_style(div69, "height", /*height*/ ctx[40] + "px");
+    			set_style(div69, "width", "" + (width$1+15) + "px");
+    			set_style(div69, "height", "" + height$1 + "px");
     			set_style(div69, "position", "absolute");
     			set_style(div69, "top", "120px");
     			set_style(div69, "left", "10px");
@@ -24969,9 +23946,9 @@
     			add_location(div69, file$3, 822, 6, 28359);
     			set_style(div70, "pointer-events", "none");
     			set_style(div70, "position", "absolute");
-    			set_style(div70, "top", /*height*/ ctx[40] + 84 + "px");
-    			set_style(div70, "left", 0 + "px");
-    			set_style(div70, "width", 780 + "px");
+    			set_style(div70, "top", "" + (height$1+84) + "px");
+    			set_style(div70, "left", "" + 0 + "px");
+    			set_style(div70, "width", "" + 780 + "px");
     			set_style(div70, "opacity", "1.0");
     			set_style(div70, "height", "25px");
     			set_style(div70, "cursor", "col-resize");
@@ -24987,15 +23964,11 @@
     			set_style(div72, "left", "10px");
     			set_style(div72, "top", "10px");
     			add_location(div72, file$3, 864, 6, 30589);
-
-    			set_style(div73, "opacity", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 192
-    			? 1
-    			: 0.2);
-
+    			set_style(div73, "opacity", (ctx.xScaleTime(ctx.InterventionTime) >= 192? 1.0 : 0.2));
     			add_location(div73, file$3, 863, 4, 30512);
     			set_style(div74, "flex", "0 0 890px");
     			set_style(div74, "width", "890px");
-    			set_style(div74, "height", /*height*/ ctx[40] + 128 + "px");
+    			set_style(div74, "height", "" + (height$1+128) + "px");
     			set_style(div74, "position", "relative");
     			add_location(div74, file$3, 730, 2, 24624);
     			attr_dev(div75, "class", "chart svelte-1vzb36m");
@@ -25024,7 +23997,7 @@
     			attr_dev(input1, "class", "range svelte-1vzb36m");
     			set_style(input1, "margin-bottom", "8px");
     			attr_dev(input1, "type", "range");
-    			attr_dev(input1, "min", input1_min_value = 5);
+    			attr_dev(input1, "min", 5);
     			attr_dev(input1, "max", "25");
     			attr_dev(input1, "step", "0.01");
     			add_location(input1, file$3, 886, 6, 31419);
@@ -25038,7 +24011,7 @@
     			add_location(div84, file$3, 888, 6, 31662);
     			attr_dev(input2, "class", "range svelte-1vzb36m");
     			attr_dev(input2, "type", "range");
-    			attr_dev(input2, "min", input2_min_value = 1);
+    			attr_dev(input2, "min", 1);
     			attr_dev(input2, "max", "10000");
     			attr_dev(input2, "step", "1");
     			add_location(input2, file$3, 889, 6, 31703);
@@ -25074,7 +24047,7 @@
     			attr_dev(input4, "class", "range svelte-1vzb36m");
     			set_style(input4, "margin-bottom", "8px");
     			attr_dev(input4, "type", "range");
-    			attr_dev(input4, "min", input4_min_value = 0.15);
+    			attr_dev(input4, "min", 0.15);
     			attr_dev(input4, "max", "24");
     			attr_dev(input4, "step", "0.0001");
     			add_location(input4, file$3, 905, 6, 32514);
@@ -25089,7 +24062,7 @@
     			add_location(div95, file$3, 907, 6, 32817);
     			attr_dev(input5, "class", "range svelte-1vzb36m");
     			attr_dev(input5, "type", "range");
-    			attr_dev(input5, "min", input5_min_value = 0);
+    			attr_dev(input5, "min", 0);
     			attr_dev(input5, "max", "24");
     			attr_dev(input5, "step", "0.01");
     			add_location(input5, file$3, 908, 6, 32873);
@@ -25109,7 +24082,7 @@
     			attr_dev(input6, "class", "range svelte-1vzb36m");
     			set_style(input6, "margin-bottom", "8px");
     			attr_dev(input6, "type", "range");
-    			attr_dev(input6, "min", input6_min_value = 0);
+    			attr_dev(input6, "min", 0);
     			attr_dev(input6, "max", "1");
     			attr_dev(input6, "step", "0.0001");
     			add_location(input6, file$3, 917, 6, 33262);
@@ -25123,7 +24096,7 @@
     			add_location(div102, file$3, 919, 6, 33523);
     			attr_dev(input7, "class", "range svelte-1vzb36m");
     			attr_dev(input7, "type", "range");
-    			attr_dev(input7, "min", input7_min_value = /*D_infectious*/ ctx[7] + 0.1);
+    			attr_dev(input7, "min", input7_min_value = (ctx.D_infectious)+0.1);
     			attr_dev(input7, "max", "100");
     			attr_dev(input7, "step", "0.01");
     			add_location(input7, file$3, 920, 6, 33580);
@@ -25140,7 +24113,7 @@
     			attr_dev(input8, "class", "range svelte-1vzb36m");
     			set_style(input8, "margin-bottom", "8px");
     			attr_dev(input8, "type", "range");
-    			attr_dev(input8, "min", input8_min_value = 0.1);
+    			attr_dev(input8, "min", 0.1);
     			attr_dev(input8, "max", "100");
     			attr_dev(input8, "step", "0.01");
     			add_location(input8, file$3, 927, 6, 33934);
@@ -25154,7 +24127,7 @@
     			add_location(div108, file$3, 929, 6, 34203);
     			attr_dev(input9, "class", "range svelte-1vzb36m");
     			attr_dev(input9, "type", "range");
-    			attr_dev(input9, "min", input9_min_value = 0.5);
+    			attr_dev(input9, "min", 0.5);
     			attr_dev(input9, "max", "100");
     			attr_dev(input9, "step", "0.01");
     			add_location(input9, file$3, 930, 6, 34262);
@@ -25171,7 +24144,7 @@
     			attr_dev(input10, "class", "range svelte-1vzb36m");
     			set_style(input10, "margin-bottom", "8px");
     			attr_dev(input10, "type", "range");
-    			attr_dev(input10, "min", input10_min_value = 0);
+    			attr_dev(input10, "min", 0);
     			attr_dev(input10, "max", "1");
     			attr_dev(input10, "step", "0.0001");
     			add_location(input10, file$3, 937, 6, 34605);
@@ -25185,7 +24158,7 @@
     			add_location(div114, file$3, 939, 6, 34855);
     			attr_dev(input11, "class", "range svelte-1vzb36m");
     			attr_dev(input11, "type", "range");
-    			attr_dev(input11, "min", input11_min_value = 0.5);
+    			attr_dev(input11, "min", 0.5);
     			attr_dev(input11, "max", "100");
     			attr_dev(input11, "step", "0.01");
     			add_location(input11, file$3, 940, 6, 34913);
@@ -25198,287 +24171,291 @@
     			set_style(div118, "position", "relative");
     			set_style(div118, "height", "12px");
     			add_location(div118, file$3, 946, 0, 35031);
-    			add_location(br13, file$3, 949, 377, 35483);
-    			add_location(br14, file$3, 950, 32, 35522);
-    			add_location(br15, file$3, 951, 43, 35572);
+    			attr_dev(a0, "href", "http://gabgoh.github.io/");
+    			attr_dev(a0, "class", "svelte-1vzb36m");
+    			add_location(a0, file$3, 949, 67, 35173);
+    			add_location(br13, file$3, 949, 690, 35796);
+    			add_location(br14, file$3, 950, 32, 35835);
+    			add_location(br15, file$3, 951, 43, 35885);
     			attr_dev(p0, "class", "center svelte-1vzb36m");
     			add_location(p0, file$3, 948, 0, 35085);
-    			attr_dev(a0, "href", "https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SEIR_model");
-    			attr_dev(a0, "class", "svelte-1vzb36m");
-    			add_location(a0, file$3, 955, 78, 35684);
-    			add_location(b1, file$3, 955, 75, 35681);
-    			add_location(b2, file$3, 955, 184, 35790);
-    			add_location(b3, file$3, 955, 237, 35843);
-    			set_style(span16, "color", /*colors*/ ctx[36][4]);
-    			add_location(span16, file$3, 955, 205, 35811);
-    			add_location(b4, file$3, 955, 293, 35899);
-    			set_style(span17, "color", /*colors*/ ctx[36][3]);
-    			add_location(span17, file$3, 955, 261, 35867);
-    			add_location(b5, file$3, 955, 324, 35930);
-    			add_location(span18, file$3, 955, 318, 35924);
-    			attr_dev(a1, "href", "https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext");
+    			attr_dev(a1, "href", "https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SEIR_model");
     			attr_dev(a1, "class", "svelte-1vzb36m");
-    			add_location(a1, file$3, 955, 438, 36044);
-    			attr_dev(a2, "href", "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html");
+    			add_location(a1, file$3, 955, 78, 35997);
+    			add_location(b1, file$3, 955, 75, 35994);
+    			add_location(b2, file$3, 955, 184, 36103);
+    			add_location(b3, file$3, 955, 236, 36155);
+    			set_style(span16, "color", ctx.colors[4]);
+    			add_location(span16, file$3, 955, 204, 36123);
+    			add_location(b4, file$3, 955, 292, 36211);
+    			set_style(span17, "color", ctx.colors[3]);
+    			add_location(span17, file$3, 955, 260, 36179);
+    			add_location(b5, file$3, 955, 350, 36269);
+    			set_style(span18, "color", ctx.colors[2]);
+    			add_location(span18, file$3, 955, 318, 36237);
+    			add_location(b6, file$3, 955, 390, 36309);
+    			add_location(b7, file$3, 955, 443, 36362);
+    			set_style(span19, "color", ctx.colors[4]);
+    			add_location(span19, file$3, 955, 411, 36330);
+    			add_location(b8, file$3, 955, 499, 36418);
+    			set_style(span20, "color", ctx.colors[3]);
+    			add_location(span20, file$3, 955, 467, 36386);
+    			add_location(b9, file$3, 955, 556, 36475);
+    			set_style(span21, "color", ctx.colors[3]);
+    			add_location(span21, file$3, 955, 524, 36443);
+    			add_location(i14, file$3, 955, 387, 36306);
+    			attr_dev(a2, "href", "https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext");
     			attr_dev(a2, "class", "svelte-1vzb36m");
-    			add_location(a2, file$3, 955, 548, 36154);
-    			set_style(span19, "color", "#777");
-    			add_location(span19, file$3, 956, 0, 36438);
-    			attr_dev(p1, "class", "center svelte-1vzb36m");
-    			add_location(p1, file$3, 954, 0, 35585);
-    			attr_dev(a3, "href", "https://www.cdc.gov/coronavirus/2019-ncov/hcp/guidance-risk-assesment-hcp.html");
+    			add_location(a2, file$3, 955, 676, 36595);
+    			attr_dev(a3, "href", "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html");
     			attr_dev(a3, "class", "svelte-1vzb36m");
-    			add_location(a3, file$3, 961, 197, 36875);
+    			add_location(a3, file$3, 955, 786, 36705);
+    			set_style(span22, "color", "#777");
+    			add_location(span22, file$3, 956, 0, 36989);
+    			attr_dev(p1, "class", "center svelte-1vzb36m");
+    			add_location(p1, file$3, 954, 0, 35898);
+    			attr_dev(a4, "href", "https://www.cdc.gov/coronavirus/2019-ncov/hcp/guidance-risk-assesment-hcp.html");
+    			attr_dev(a4, "class", "svelte-1vzb36m");
+    			add_location(a4, file$3, 961, 197, 37426);
     			attr_dev(input12, "type", "text");
-    			set_style(input12, "width", Math.ceil(Math.log10(/*p_num_ind*/ ctx[32])) * 9.5 + 5 + "px");
+    			set_style(input12, "width", "" + (ctx.Math.ceil(ctx.Math.log10(ctx.p_num_ind))*9.5 + 5) + "px");
     			set_style(input12, "font-size", "15.5px");
     			set_style(input12, "color", "#777");
-    			add_location(input12, file$3, 961, 310, 36988);
-    			attr_dev(a4, "href", "https://www.cdc.gov/mmwr/volumes/69/wr/mm6909e1.htm?s_cid=mm6909e1_w");
-    			attr_dev(a4, "class", "svelte-1vzb36m");
-    			add_location(a4, file$3, 961, 572, 37250);
+    			add_location(input12, file$3, 961, 310, 37539);
+    			attr_dev(a5, "href", "https://www.cdc.gov/mmwr/volumes/69/wr/mm6909e1.htm?s_cid=mm6909e1_w");
+    			attr_dev(a5, "class", "svelte-1vzb36m");
+    			add_location(a5, file$3, 961, 572, 37801);
     			attr_dev(p2, "class", "center svelte-1vzb36m");
-    			add_location(p2, file$3, 960, 0, 36657);
+    			add_location(p2, file$3, 960, 0, 37208);
     			attr_dev(p3, "class", "center svelte-1vzb36m");
-    			add_location(p3, file$3, 965, 0, 37355);
+    			add_location(p3, file$3, 965, 0, 37906);
     			attr_dev(th0, "class", "svelte-1vzb36m");
-    			add_location(th0, file$3, 972, 4, 37574);
+    			add_location(th0, file$3, 972, 4, 38125);
     			attr_dev(th1, "class", "svelte-1vzb36m");
-    			add_location(th1, file$3, 973, 4, 37588);
-    			add_location(br16, file$3, 974, 28, 37631);
+    			add_location(th1, file$3, 973, 4, 38139);
+    			add_location(br16, file$3, 974, 28, 38182);
     			html_tag_3 = new HtmlTag(raw5_value, null);
     			attr_dev(th2, "class", "svelte-1vzb36m");
-    			add_location(th2, file$3, 974, 4, 37607);
-    			add_location(br17, file$3, 975, 28, 37707);
-    			html_tag_4 = new HtmlTag(raw6_value, t278);
+    			add_location(th2, file$3, 974, 4, 38158);
+    			add_location(br17, file$3, 975, 28, 38258);
+    			html_tag_4 = new HtmlTag(raw6_value, t289);
     			attr_dev(th3, "class", "svelte-1vzb36m");
-    			add_location(th3, file$3, 975, 4, 37683);
-    			add_location(br18, file$3, 976, 27, 37793);
-    			html_tag_5 = new HtmlTag(raw7_value, t282);
+    			add_location(th3, file$3, 975, 4, 38234);
+    			add_location(br18, file$3, 976, 27, 38344);
+    			html_tag_5 = new HtmlTag(raw7_value, t293);
     			attr_dev(th4, "class", "svelte-1vzb36m");
-    			add_location(th4, file$3, 976, 4, 37770);
+    			add_location(th4, file$3, 976, 4, 38321);
     			attr_dev(tr0, "class", "svelte-1vzb36m");
-    			add_location(tr0, file$3, 971, 2, 37565);
-    			attr_dev(a5, "href", "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html");
-    			attr_dev(a5, "class", "svelte-1vzb36m");
-    			add_location(a5, file$3, 979, 20, 37887);
+    			add_location(tr0, file$3, 971, 2, 38116);
+    			attr_dev(a6, "href", "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html");
+    			attr_dev(a6, "class", "svelte-1vzb36m");
+    			add_location(a6, file$3, 979, 20, 38438);
     			attr_dev(td0, "width", "27%");
     			attr_dev(td0, "class", "svelte-1vzb36m");
-    			add_location(td0, file$3, 979, 4, 37871);
+    			add_location(td0, file$3, 979, 4, 38422);
     			attr_dev(td1, "class", "svelte-1vzb36m");
-    			add_location(td1, file$3, 980, 4, 38024);
+    			add_location(td1, file$3, 980, 4, 38575);
     			attr_dev(td2, "class", "svelte-1vzb36m");
-    			add_location(td2, file$3, 981, 4, 38048);
+    			add_location(td2, file$3, 981, 4, 38599);
     			attr_dev(td3, "class", "svelte-1vzb36m");
-    			add_location(td3, file$3, 982, 4, 38077);
+    			add_location(td3, file$3, 982, 4, 38628);
     			attr_dev(td4, "class", "svelte-1vzb36m");
-    			add_location(td4, file$3, 983, 4, 38094);
+    			add_location(td4, file$3, 983, 4, 38645);
     			attr_dev(tr1, "class", "svelte-1vzb36m");
-    			add_location(tr1, file$3, 978, 2, 37862);
-    			attr_dev(a6, "href", "https://www.nejm.org/doi/full/10.1056/NEJMoa2001316");
-    			attr_dev(a6, "class", "svelte-1vzb36m");
-    			add_location(a6, file$3, 986, 8, 38130);
-    			attr_dev(td5, "class", "svelte-1vzb36m");
-    			add_location(td5, file$3, 986, 4, 38126);
-    			attr_dev(td6, "class", "svelte-1vzb36m");
-    			add_location(td6, file$3, 987, 4, 38227);
-    			attr_dev(td7, "class", "svelte-1vzb36m");
-    			add_location(td7, file$3, 988, 4, 38251);
-    			attr_dev(td8, "class", "svelte-1vzb36m");
-    			add_location(td8, file$3, 989, 4, 38280);
-    			attr_dev(td9, "class", "svelte-1vzb36m");
-    			add_location(td9, file$3, 990, 4, 38309);
-    			attr_dev(tr2, "class", "svelte-1vzb36m");
-    			add_location(tr2, file$3, 985, 2, 38117);
-    			attr_dev(a7, "href", "https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext");
+    			add_location(tr1, file$3, 978, 2, 38413);
+    			attr_dev(a7, "href", "https://www.nejm.org/doi/full/10.1056/NEJMoa2001316");
     			attr_dev(a7, "class", "svelte-1vzb36m");
-    			add_location(a7, file$3, 993, 8, 38358);
-    			attr_dev(td10, "class", "svelte-1vzb36m");
-    			add_location(td10, file$3, 993, 4, 38354);
-    			attr_dev(td11, "class", "svelte-1vzb36m");
-    			add_location(td11, file$3, 994, 4, 38477);
-    			attr_dev(td12, "class", "svelte-1vzb36m");
-    			add_location(td12, file$3, 995, 4, 38509);
-    			attr_dev(td13, "class", "svelte-1vzb36m");
-    			add_location(td13, file$3, 996, 4, 38541);
-    			attr_dev(td14, "class", "svelte-1vzb36m");
-    			add_location(td14, file$3, 997, 4, 38558);
-    			attr_dev(tr3, "class", "svelte-1vzb36m");
-    			add_location(tr3, file$3, 992, 2, 38345);
-    			attr_dev(a8, "href", "https://www.who.int/news-room/detail/23-01-2020-statement-on-the-meeting-of-the-international-health-regulations-(2005)-emergency-committee-regarding-the-outbreak-of-novel-coronavirus-(2019-ncov)");
+    			add_location(a7, file$3, 986, 8, 38681);
+    			attr_dev(td5, "class", "svelte-1vzb36m");
+    			add_location(td5, file$3, 986, 4, 38677);
+    			attr_dev(td6, "class", "svelte-1vzb36m");
+    			add_location(td6, file$3, 987, 4, 38778);
+    			attr_dev(td7, "class", "svelte-1vzb36m");
+    			add_location(td7, file$3, 988, 4, 38802);
+    			attr_dev(td8, "class", "svelte-1vzb36m");
+    			add_location(td8, file$3, 989, 4, 38831);
+    			attr_dev(td9, "class", "svelte-1vzb36m");
+    			add_location(td9, file$3, 990, 4, 38860);
+    			attr_dev(tr2, "class", "svelte-1vzb36m");
+    			add_location(tr2, file$3, 985, 2, 38668);
+    			attr_dev(a8, "href", "https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext");
     			attr_dev(a8, "class", "svelte-1vzb36m");
-    			add_location(a8, file$3, 1000, 8, 38594);
-    			attr_dev(td15, "class", "svelte-1vzb36m");
-    			add_location(td15, file$3, 1000, 4, 38590);
-    			attr_dev(td16, "class", "svelte-1vzb36m");
-    			add_location(td16, file$3, 1001, 4, 38836);
-    			attr_dev(td17, "class", "svelte-1vzb36m");
-    			add_location(td17, file$3, 1002, 4, 38860);
-    			attr_dev(td18, "class", "svelte-1vzb36m");
-    			add_location(td18, file$3, 1003, 4, 38890);
-    			attr_dev(td19, "class", "svelte-1vzb36m");
-    			add_location(td19, file$3, 1004, 4, 38904);
-    			attr_dev(tr4, "class", "svelte-1vzb36m");
-    			add_location(tr4, file$3, 999, 2, 38581);
-    			attr_dev(a9, "href", "https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf");
+    			add_location(a8, file$3, 993, 8, 38909);
+    			attr_dev(td10, "class", "svelte-1vzb36m");
+    			add_location(td10, file$3, 993, 4, 38905);
+    			attr_dev(td11, "class", "svelte-1vzb36m");
+    			add_location(td11, file$3, 994, 4, 39028);
+    			attr_dev(td12, "class", "svelte-1vzb36m");
+    			add_location(td12, file$3, 995, 4, 39060);
+    			attr_dev(td13, "class", "svelte-1vzb36m");
+    			add_location(td13, file$3, 996, 4, 39092);
+    			attr_dev(td14, "class", "svelte-1vzb36m");
+    			add_location(td14, file$3, 997, 4, 39109);
+    			attr_dev(tr3, "class", "svelte-1vzb36m");
+    			add_location(tr3, file$3, 992, 2, 38896);
+    			attr_dev(a9, "href", "https://www.who.int/news-room/detail/23-01-2020-statement-on-the-meeting-of-the-international-health-regulations-(2005)-emergency-committee-regarding-the-outbreak-of-novel-coronavirus-(2019-ncov)");
     			attr_dev(a9, "class", "svelte-1vzb36m");
-    			add_location(a9, file$3, 1007, 8, 38937);
-    			attr_dev(td20, "class", "svelte-1vzb36m");
-    			add_location(td20, file$3, 1007, 4, 38933);
-    			attr_dev(td21, "class", "svelte-1vzb36m");
-    			add_location(td21, file$3, 1008, 4, 39093);
-    			attr_dev(td22, "class", "svelte-1vzb36m");
-    			add_location(td22, file$3, 1009, 4, 39117);
-    			attr_dev(td23, "class", "svelte-1vzb36m");
-    			add_location(td23, file$3, 1010, 4, 39147);
-    			attr_dev(td24, "class", "svelte-1vzb36m");
-    			add_location(td24, file$3, 1011, 4, 39176);
-    			attr_dev(tr5, "class", "svelte-1vzb36m");
-    			add_location(tr5, file$3, 1006, 2, 38924);
-    			attr_dev(a10, "href", "https://www.biorxiv.org/content/10.1101/2020.01.25.919787v2");
+    			add_location(a9, file$3, 1000, 8, 39145);
+    			attr_dev(td15, "class", "svelte-1vzb36m");
+    			add_location(td15, file$3, 1000, 4, 39141);
+    			attr_dev(td16, "class", "svelte-1vzb36m");
+    			add_location(td16, file$3, 1001, 4, 39387);
+    			attr_dev(td17, "class", "svelte-1vzb36m");
+    			add_location(td17, file$3, 1002, 4, 39411);
+    			attr_dev(td18, "class", "svelte-1vzb36m");
+    			add_location(td18, file$3, 1003, 4, 39441);
+    			attr_dev(td19, "class", "svelte-1vzb36m");
+    			add_location(td19, file$3, 1004, 4, 39455);
+    			attr_dev(tr4, "class", "svelte-1vzb36m");
+    			add_location(tr4, file$3, 999, 2, 39132);
+    			attr_dev(a10, "href", "https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf");
     			attr_dev(a10, "class", "svelte-1vzb36m");
-    			add_location(a10, file$3, 1014, 8, 39209);
-    			attr_dev(td25, "class", "svelte-1vzb36m");
-    			add_location(td25, file$3, 1014, 4, 39205);
-    			attr_dev(td26, "class", "svelte-1vzb36m");
-    			add_location(td26, file$3, 1015, 4, 39306);
-    			attr_dev(td27, "class", "svelte-1vzb36m");
-    			add_location(td27, file$3, 1016, 4, 39329);
-    			attr_dev(td28, "class", "svelte-1vzb36m");
-    			add_location(td28, file$3, 1017, 4, 39358);
-    			attr_dev(td29, "class", "svelte-1vzb36m");
-    			add_location(td29, file$3, 1018, 4, 39388);
-    			attr_dev(tr6, "class", "svelte-1vzb36m");
-    			add_location(tr6, file$3, 1013, 2, 39196);
-    			attr_dev(a11, "href", "https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa030/5766334");
+    			add_location(a10, file$3, 1007, 8, 39488);
+    			attr_dev(td20, "class", "svelte-1vzb36m");
+    			add_location(td20, file$3, 1007, 4, 39484);
+    			attr_dev(td21, "class", "svelte-1vzb36m");
+    			add_location(td21, file$3, 1008, 4, 39644);
+    			attr_dev(td22, "class", "svelte-1vzb36m");
+    			add_location(td22, file$3, 1009, 4, 39668);
+    			attr_dev(td23, "class", "svelte-1vzb36m");
+    			add_location(td23, file$3, 1010, 4, 39698);
+    			attr_dev(td24, "class", "svelte-1vzb36m");
+    			add_location(td24, file$3, 1011, 4, 39727);
+    			attr_dev(tr5, "class", "svelte-1vzb36m");
+    			add_location(tr5, file$3, 1006, 2, 39475);
+    			attr_dev(a11, "href", "https://www.biorxiv.org/content/10.1101/2020.01.25.919787v2");
     			attr_dev(a11, "class", "svelte-1vzb36m");
-    			add_location(a11, file$3, 1021, 8, 39434);
-    			attr_dev(td30, "class", "svelte-1vzb36m");
-    			add_location(td30, file$3, 1021, 4, 39430);
-    			attr_dev(td31, "class", "svelte-1vzb36m");
-    			add_location(td31, file$3, 1022, 4, 39569);
-    			attr_dev(td32, "class", "svelte-1vzb36m");
-    			add_location(td32, file$3, 1023, 4, 39599);
-    			attr_dev(td33, "class", "svelte-1vzb36m");
-    			add_location(td33, file$3, 1024, 4, 39617);
-    			attr_dev(td34, "class", "svelte-1vzb36m");
-    			add_location(td34, file$3, 1025, 4, 39634);
-    			attr_dev(tr7, "class", "svelte-1vzb36m");
-    			add_location(tr7, file$3, 1020, 2, 39421);
-    			attr_dev(a12, "href", "https://www.eurosurveillance.org/content/10.2807/1560-7917.ES.2020.25.5.2000062");
+    			add_location(a11, file$3, 1014, 8, 39760);
+    			attr_dev(td25, "class", "svelte-1vzb36m");
+    			add_location(td25, file$3, 1014, 4, 39756);
+    			attr_dev(td26, "class", "svelte-1vzb36m");
+    			add_location(td26, file$3, 1015, 4, 39857);
+    			attr_dev(td27, "class", "svelte-1vzb36m");
+    			add_location(td27, file$3, 1016, 4, 39880);
+    			attr_dev(td28, "class", "svelte-1vzb36m");
+    			add_location(td28, file$3, 1017, 4, 39909);
+    			attr_dev(td29, "class", "svelte-1vzb36m");
+    			add_location(td29, file$3, 1018, 4, 39939);
+    			attr_dev(tr6, "class", "svelte-1vzb36m");
+    			add_location(tr6, file$3, 1013, 2, 39747);
+    			attr_dev(a12, "href", "https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa030/5766334");
     			attr_dev(a12, "class", "svelte-1vzb36m");
-    			add_location(a12, file$3, 1028, 8, 39671);
-    			attr_dev(td35, "class", "svelte-1vzb36m");
-    			add_location(td35, file$3, 1028, 4, 39667);
-    			attr_dev(td36, "class", "svelte-1vzb36m");
-    			add_location(td36, file$3, 1029, 4, 39806);
-    			attr_dev(td37, "class", "svelte-1vzb36m");
-    			add_location(td37, file$3, 1030, 4, 39825);
-    			attr_dev(td38, "class", "svelte-1vzb36m");
-    			add_location(td38, file$3, 1031, 4, 39839);
-    			attr_dev(td39, "class", "svelte-1vzb36m");
-    			add_location(td39, file$3, 1032, 4, 39868);
-    			attr_dev(tr8, "class", "svelte-1vzb36m");
-    			add_location(tr8, file$3, 1027, 2, 39658);
-    			attr_dev(a13, "href", "https://www.medrxiv.org/content/10.1101/2020.01.23.20018549v2.article-info");
+    			add_location(a12, file$3, 1021, 8, 39985);
+    			attr_dev(td30, "class", "svelte-1vzb36m");
+    			add_location(td30, file$3, 1021, 4, 39981);
+    			attr_dev(td31, "class", "svelte-1vzb36m");
+    			add_location(td31, file$3, 1022, 4, 40120);
+    			attr_dev(td32, "class", "svelte-1vzb36m");
+    			add_location(td32, file$3, 1023, 4, 40150);
+    			attr_dev(td33, "class", "svelte-1vzb36m");
+    			add_location(td33, file$3, 1024, 4, 40168);
+    			attr_dev(td34, "class", "svelte-1vzb36m");
+    			add_location(td34, file$3, 1025, 4, 40185);
+    			attr_dev(tr7, "class", "svelte-1vzb36m");
+    			add_location(tr7, file$3, 1020, 2, 39972);
+    			attr_dev(a13, "href", "https://www.eurosurveillance.org/content/10.2807/1560-7917.ES.2020.25.5.2000062");
     			attr_dev(a13, "class", "svelte-1vzb36m");
-    			add_location(a13, file$3, 1035, 8, 39901);
-    			attr_dev(td40, "class", "svelte-1vzb36m");
-    			add_location(td40, file$3, 1035, 4, 39897);
-    			attr_dev(td41, "class", "svelte-1vzb36m");
-    			add_location(td41, file$3, 1036, 4, 40013);
-    			attr_dev(td42, "class", "svelte-1vzb36m");
-    			add_location(td42, file$3, 1037, 4, 40032);
-    			attr_dev(td43, "class", "svelte-1vzb36m");
-    			add_location(td43, file$3, 1038, 4, 40064);
-    			attr_dev(td44, "class", "svelte-1vzb36m");
-    			add_location(td44, file$3, 1039, 4, 40078);
-    			attr_dev(tr9, "class", "svelte-1vzb36m");
-    			add_location(tr9, file$3, 1034, 2, 39888);
-    			attr_dev(a14, "href", "https://www.medrxiv.org/content/10.1101/2020.03.03.20028423v1");
+    			add_location(a13, file$3, 1028, 8, 40222);
+    			attr_dev(td35, "class", "svelte-1vzb36m");
+    			add_location(td35, file$3, 1028, 4, 40218);
+    			attr_dev(td36, "class", "svelte-1vzb36m");
+    			add_location(td36, file$3, 1029, 4, 40357);
+    			attr_dev(td37, "class", "svelte-1vzb36m");
+    			add_location(td37, file$3, 1030, 4, 40376);
+    			attr_dev(td38, "class", "svelte-1vzb36m");
+    			add_location(td38, file$3, 1031, 4, 40390);
+    			attr_dev(td39, "class", "svelte-1vzb36m");
+    			add_location(td39, file$3, 1032, 4, 40419);
+    			attr_dev(tr8, "class", "svelte-1vzb36m");
+    			add_location(tr8, file$3, 1027, 2, 40209);
+    			attr_dev(a14, "href", "https://www.medrxiv.org/content/10.1101/2020.01.23.20018549v2.article-info");
     			attr_dev(a14, "class", "svelte-1vzb36m");
-    			add_location(a14, file$3, 1042, 8, 40111);
-    			attr_dev(td45, "class", "svelte-1vzb36m");
-    			add_location(td45, file$3, 1042, 4, 40107);
-    			attr_dev(td46, "class", "svelte-1vzb36m");
-    			add_location(td46, file$3, 1043, 4, 40208);
-    			attr_dev(td47, "class", "svelte-1vzb36m");
-    			add_location(td47, file$3, 1044, 4, 40230);
-    			attr_dev(td48, "class", "svelte-1vzb36m");
-    			add_location(td48, file$3, 1045, 4, 40244);
-    			attr_dev(td49, "class", "svelte-1vzb36m");
-    			add_location(td49, file$3, 1046, 4, 40273);
-    			attr_dev(td50, "class", "svelte-1vzb36m");
-    			add_location(td50, file$3, 1047, 4, 40300);
-    			attr_dev(tr10, "class", "svelte-1vzb36m");
-    			add_location(tr10, file$3, 1041, 2, 40098);
-    			attr_dev(a15, "href", "https://www.mdpi.com/2077-0383/9/2/462");
+    			add_location(a14, file$3, 1035, 8, 40452);
+    			attr_dev(td40, "class", "svelte-1vzb36m");
+    			add_location(td40, file$3, 1035, 4, 40448);
+    			attr_dev(td41, "class", "svelte-1vzb36m");
+    			add_location(td41, file$3, 1036, 4, 40564);
+    			attr_dev(td42, "class", "svelte-1vzb36m");
+    			add_location(td42, file$3, 1037, 4, 40583);
+    			attr_dev(td43, "class", "svelte-1vzb36m");
+    			add_location(td43, file$3, 1038, 4, 40615);
+    			attr_dev(td44, "class", "svelte-1vzb36m");
+    			add_location(td44, file$3, 1039, 4, 40629);
+    			attr_dev(tr9, "class", "svelte-1vzb36m");
+    			add_location(tr9, file$3, 1034, 2, 40439);
+    			attr_dev(a15, "href", "https://www.medrxiv.org/content/10.1101/2020.03.03.20028423v1");
     			attr_dev(a15, "class", "svelte-1vzb36m");
-    			add_location(a15, file$3, 1051, 8, 40334);
+    			add_location(a15, file$3, 1042, 8, 40662);
+    			attr_dev(td45, "class", "svelte-1vzb36m");
+    			add_location(td45, file$3, 1042, 4, 40658);
+    			attr_dev(td46, "class", "svelte-1vzb36m");
+    			add_location(td46, file$3, 1043, 4, 40759);
+    			attr_dev(td47, "class", "svelte-1vzb36m");
+    			add_location(td47, file$3, 1044, 4, 40781);
+    			attr_dev(td48, "class", "svelte-1vzb36m");
+    			add_location(td48, file$3, 1045, 4, 40795);
+    			attr_dev(td49, "class", "svelte-1vzb36m");
+    			add_location(td49, file$3, 1046, 4, 40824);
+    			attr_dev(td50, "class", "svelte-1vzb36m");
+    			add_location(td50, file$3, 1047, 4, 40851);
+    			attr_dev(tr10, "class", "svelte-1vzb36m");
+    			add_location(tr10, file$3, 1041, 2, 40649);
+    			attr_dev(a16, "href", "https://www.mdpi.com/2077-0383/9/2/462");
+    			attr_dev(a16, "class", "svelte-1vzb36m");
+    			add_location(a16, file$3, 1051, 8, 40885);
     			attr_dev(td51, "class", "svelte-1vzb36m");
-    			add_location(td51, file$3, 1051, 4, 40330);
+    			add_location(td51, file$3, 1051, 4, 40881);
     			attr_dev(td52, "class", "svelte-1vzb36m");
-    			add_location(td52, file$3, 1052, 4, 40410);
+    			add_location(td52, file$3, 1052, 4, 40961);
     			attr_dev(td53, "class", "svelte-1vzb36m");
-    			add_location(td53, file$3, 1053, 4, 40429);
+    			add_location(td53, file$3, 1053, 4, 40980);
     			attr_dev(td54, "class", "svelte-1vzb36m");
-    			add_location(td54, file$3, 1054, 4, 40461);
+    			add_location(td54, file$3, 1054, 4, 41012);
     			attr_dev(td55, "class", "svelte-1vzb36m");
-    			add_location(td55, file$3, 1055, 4, 40475);
+    			add_location(td55, file$3, 1055, 4, 41026);
     			attr_dev(tr11, "class", "svelte-1vzb36m");
-    			add_location(tr11, file$3, 1050, 2, 40321);
+    			add_location(tr11, file$3, 1050, 2, 40872);
     			set_style(table, "width", "100%");
     			set_style(table, "margin", "auto");
     			set_style(table, "font-weight", "300");
     			set_style(table, "border-spacing", "inherit");
-    			add_location(table, file$3, 970, 0, 37480);
+    			add_location(table, file$3, 970, 0, 38031);
     			attr_dev(div119, "class", "center svelte-1vzb36m");
-    			add_location(div119, file$3, 969, 0, 37459);
-    			attr_dev(a16, "href", "https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa021/5735319");
-    			attr_dev(a16, "class", "svelte-1vzb36m");
-    			add_location(a16, file$3, 1063, 9, 40540);
-    			attr_dev(a17, "href", "https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf");
+    			add_location(div119, file$3, 969, 0, 38010);
+    			attr_dev(a17, "href", "https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa021/5735319");
     			attr_dev(a17, "class", "svelte-1vzb36m");
-    			add_location(a17, file$3, 1063, 279, 40810);
-    			attr_dev(p4, "class", "center svelte-1vzb36m");
-    			add_location(p4, file$3, 1062, 0, 40512);
-    			attr_dev(a18, "href", "https://twitter.com/gabeeegoooh");
+    			add_location(a17, file$3, 1063, 9, 41091);
+    			attr_dev(a18, "href", "https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf");
     			attr_dev(a18, "class", "svelte-1vzb36m");
-    			add_location(a18, file$3, 1067, 22, 40990);
-    			attr_dev(a19, "href", "mailto:izmegabe@gmail.com");
-    			attr_dev(a19, "class", "svelte-1vzb36m");
-    			add_location(a19, file$3, 1067, 85, 41053);
-    			attr_dev(a20, "href", "http://gabgoh.github.io/");
-    			attr_dev(a20, "class", "svelte-1vzb36m");
-    			add_location(a20, file$3, 1067, 134, 41102);
+    			add_location(a18, file$3, 1063, 279, 41361);
+    			attr_dev(p4, "class", "center svelte-1vzb36m");
+    			add_location(p4, file$3, 1062, 0, 41063);
+    			add_location(b10, file$3, 1068, 0, 41522);
+    			add_location(br19, file$3, 1068, 27, 41549);
+    			html_tag_6 = new HtmlTag(raw8_value, t404);
+    			add_location(i15, file$3, 1069, 164, 41718);
+    			add_location(i16, file$3, 1069, 246, 41800);
+    			add_location(i17, file$3, 1069, 327, 41881);
     			attr_dev(p5, "class", "center svelte-1vzb36m");
-    			add_location(p5, file$3, 1066, 0, 40949);
-    			add_location(b6, file$3, 1072, 0, 41178);
-    			add_location(br19, file$3, 1072, 27, 41205);
-    			html_tag_6 = new HtmlTag(raw8_value, t401);
-    			add_location(i14, file$3, 1073, 164, 41374);
-    			add_location(i15, file$3, 1073, 246, 41456);
-    			add_location(i16, file$3, 1073, 327, 41537);
-    			attr_dev(p6, "class", "center svelte-1vzb36m");
-    			add_location(p6, file$3, 1071, 0, 41157);
-    			add_location(b7, file$3, 1077, 0, 42030);
-    			add_location(br20, file$3, 1077, 23, 42053);
-    			attr_dev(a21, "href", "https://enkimute.github.io/");
+    			add_location(p5, file$3, 1067, 0, 41501);
+    			add_location(b11, file$3, 1073, 0, 42374);
+    			add_location(br20, file$3, 1073, 23, 42397);
+    			attr_dev(a19, "href", "https://enkimute.github.io/");
+    			attr_dev(a19, "class", "svelte-1vzb36m");
+    			add_location(a19, file$3, 1074, 0, 42402);
+    			attr_dev(a20, "href", "https://twitter.com/ch402");
+    			attr_dev(a20, "class", "svelte-1vzb36m");
+    			add_location(a20, file$3, 1074, 83, 42485);
+    			attr_dev(a21, "href", "https://twitter.com/shancarter");
     			attr_dev(a21, "class", "svelte-1vzb36m");
-    			add_location(a21, file$3, 1078, 0, 42058);
-    			attr_dev(a22, "href", "https://twitter.com/ch402");
+    			add_location(a21, file$3, 1074, 135, 42537);
+    			attr_dev(a22, "href", "https://twitter.com/ludwigschubert");
     			attr_dev(a22, "class", "svelte-1vzb36m");
-    			add_location(a22, file$3, 1078, 82, 42140);
-    			attr_dev(a23, "href", "https://twitter.com/shancarter");
-    			attr_dev(a23, "class", "svelte-1vzb36m");
-    			add_location(a23, file$3, 1078, 134, 42192);
-    			attr_dev(a24, "href", "https://twitter.com/ludwigschubert");
-    			attr_dev(a24, "class", "svelte-1vzb36m");
-    			add_location(a24, file$3, 1079, 9, 42254);
-    			attr_dev(p7, "class", "center svelte-1vzb36m");
-    			add_location(p7, file$3, 1076, 0, 42009);
+    			add_location(a22, file$3, 1075, 7, 42597);
+    			attr_dev(p6, "class", "center svelte-1vzb36m");
+    			add_location(p6, file$3, 1072, 0, 42353);
     			attr_dev(div120, "class", "legendtext svelte-1vzb36m");
-    			add_location(div120, file$3, 1087, 4, 42523);
+    			add_location(div120, file$3, 1083, 4, 42880);
     			attr_dev(textarea, "type", "textarea");
     			attr_dev(textarea, "rows", "1");
     			attr_dev(textarea, "cols", "5000");
@@ -25488,21 +24465,53 @@
     			set_style(textarea, "text-align", "left");
     			attr_dev(textarea, "id", "fname");
     			attr_dev(textarea, "name", "fname");
-    			textarea.value = /*state*/ ctx[16];
-    			add_location(textarea, file$3, 1089, 6, 42596);
-    			add_location(form, file$3, 1088, 4, 42583);
+    			textarea.value = ctx.state;
+    			add_location(textarea, file$3, 1085, 6, 42953);
+    			add_location(form, file$3, 1084, 4, 42940);
     			attr_dev(div121, "class", "center svelte-1vzb36m");
     			set_style(div121, "padding", "10px");
     			set_style(div121, "margin-top", "3px");
     			set_style(div121, "width", "925px");
-    			add_location(div121, file$3, 1086, 2, 42445);
+    			add_location(div121, file$3, 1082, 2, 42802);
     			set_style(div122, "margin-bottom", "30px");
-    			add_location(div122, file$3, 1084, 0, 42408);
+    			add_location(div122, file$3, 1080, 0, 42765);
+
+    			dispose = [
+    				listen_dev(div64, "mousedown", ctx.lock_yaxis),
+    				listen_dev(input0, "change", ctx.input0_change_input_handler),
+    				listen_dev(input0, "input", ctx.input0_change_input_handler),
+    				listen_dev(input0, "mousedown", ctx.lock_yaxis),
+    				listen_dev(input1, "change", ctx.input1_change_input_handler),
+    				listen_dev(input1, "input", ctx.input1_change_input_handler),
+    				listen_dev(input2, "change", ctx.input2_change_input_handler),
+    				listen_dev(input2, "input", ctx.input2_change_input_handler),
+    				listen_dev(input3, "change", ctx.input3_change_input_handler),
+    				listen_dev(input3, "input", ctx.input3_change_input_handler),
+    				listen_dev(input4, "change", ctx.input4_change_input_handler),
+    				listen_dev(input4, "input", ctx.input4_change_input_handler),
+    				listen_dev(input5, "change", ctx.input5_change_input_handler),
+    				listen_dev(input5, "input", ctx.input5_change_input_handler),
+    				listen_dev(input6, "change", ctx.input6_change_input_handler),
+    				listen_dev(input6, "input", ctx.input6_change_input_handler),
+    				listen_dev(input7, "change", ctx.input7_change_input_handler),
+    				listen_dev(input7, "input", ctx.input7_change_input_handler),
+    				listen_dev(input8, "change", ctx.input8_change_input_handler),
+    				listen_dev(input8, "input", ctx.input8_change_input_handler),
+    				listen_dev(input9, "change", ctx.input9_change_input_handler),
+    				listen_dev(input9, "input", ctx.input9_change_input_handler),
+    				listen_dev(input10, "change", ctx.input10_change_input_handler),
+    				listen_dev(input10, "input", ctx.input10_change_input_handler),
+    				listen_dev(input11, "change", ctx.input11_change_input_handler),
+    				listen_dev(input11, "input", ctx.input11_change_input_handler),
+    				listen_dev(input12, "input", ctx.input12_input_handler)
+    			];
     		},
+
     		l: function claim(nodes) {
     			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
     		},
-    		m: function mount(target, anchor, remount) {
+
+    		m: function mount(target, anchor) {
     			insert_dev(target, link, anchor);
     			insert_dev(target, t0, anchor);
     			insert_dev(target, h2, anchor);
@@ -25749,7 +24758,9 @@
     			append_dev(div64, t145);
     			append_dev(div65, t146);
     			append_dev(div65, input0);
-    			set_input_value(input0, /*InterventionAmt*/ ctx[13]);
+
+    			set_input_value(input0, ctx.InterventionAmt);
+
     			append_dev(div74, t147);
     			append_dev(div74, div70);
 
@@ -25783,7 +24794,9 @@
     			append_dev(div82, t160);
     			append_dev(div85, t161);
     			append_dev(div85, input1);
-    			set_input_value(input1, /*logN*/ ctx[2]);
+
+    			set_input_value(input1, ctx.logN);
+
     			append_dev(div85, t162);
     			append_dev(div85, div83);
     			append_dev(div83, t163);
@@ -25793,7 +24806,9 @@
     			append_dev(div84, t165);
     			append_dev(div85, t166);
     			append_dev(div85, input2);
-    			set_input_value(input2, /*I0*/ ctx[4]);
+
+    			set_input_value(input2, ctx.I0);
+
     			append_dev(div116, t167);
     			append_dev(div116, div90);
     			append_dev(div90, div88);
@@ -25809,7 +24824,9 @@
     			append_dev(div89, t172);
     			append_dev(div90, t173);
     			append_dev(div90, input3);
-    			set_input_value(input3, /*R0*/ ctx[5]);
+
+    			set_input_value(input3, ctx.R0);
+
     			append_dev(div116, t174);
     			append_dev(div116, div96);
     			append_dev(div96, div91);
@@ -25825,7 +24842,9 @@
     			append_dev(div93, t181);
     			append_dev(div96, t182);
     			append_dev(div96, input4);
-    			set_input_value(input4, /*D_incbation*/ ctx[6]);
+
+    			set_input_value(input4, ctx.D_incbation);
+
     			append_dev(div96, t183);
     			append_dev(div96, div94);
     			append_dev(div94, t184);
@@ -25838,7 +24857,9 @@
     			append_dev(div95, t188);
     			append_dev(div96, t189);
     			append_dev(div96, input5);
-    			set_input_value(input5, /*D_infectious*/ ctx[7]);
+
+    			set_input_value(input5, ctx.D_infectious);
+
     			append_dev(div116, t190);
     			append_dev(div116, div97);
     			append_dev(div116, t191);
@@ -25854,7 +24875,9 @@
     			append_dev(div100, t197);
     			append_dev(div103, t198);
     			append_dev(div103, input6);
-    			set_input_value(input6, /*CFR*/ ctx[11]);
+
+    			set_input_value(input6, ctx.CFR);
+
     			append_dev(div103, t199);
     			append_dev(div103, div101);
     			append_dev(div101, t200);
@@ -25865,7 +24888,9 @@
     			append_dev(div102, t203);
     			append_dev(div103, t204);
     			append_dev(div103, input7);
-    			set_input_value(input7, /*Time_to_death*/ ctx[1]);
+
+    			set_input_value(input7, ctx.Time_to_death);
+
     			append_dev(div116, t205);
     			append_dev(div116, div109);
     			append_dev(div109, div104);
@@ -25879,7 +24904,9 @@
     			append_dev(div106, t211);
     			append_dev(div109, t212);
     			append_dev(div109, input8);
-    			set_input_value(input8, /*D_recovery_severe*/ ctx[9]);
+
+    			set_input_value(input8, ctx.D_recovery_severe);
+
     			append_dev(div109, t213);
     			append_dev(div109, div107);
     			append_dev(div107, t214);
@@ -25890,7 +24917,9 @@
     			append_dev(div108, t217);
     			append_dev(div109, t218);
     			append_dev(div109, input9);
-    			set_input_value(input9, /*D_recovery_mild*/ ctx[8]);
+
+    			set_input_value(input9, ctx.D_recovery_mild);
+
     			append_dev(div116, t219);
     			append_dev(div116, div115);
     			append_dev(div115, div110);
@@ -25904,7 +24933,9 @@
     			append_dev(div112, t225);
     			append_dev(div115, t226);
     			append_dev(div115, input10);
-    			set_input_value(input10, /*P_SEVERE*/ ctx[15]);
+
+    			set_input_value(input10, ctx.P_SEVERE);
+
     			append_dev(div115, t227);
     			append_dev(div115, div113);
     			append_dev(div113, t228);
@@ -25915,402 +24946,429 @@
     			append_dev(div114, t231);
     			append_dev(div115, t232);
     			append_dev(div115, input11);
-    			set_input_value(input11, /*D_hospital_lag*/ ctx[10]);
+
+    			set_input_value(input11, ctx.D_hospital_lag);
+
     			insert_dev(target, t233, anchor);
     			insert_dev(target, div118, anchor);
     			insert_dev(target, t234, anchor);
     			insert_dev(target, p0, anchor);
     			append_dev(p0, t235);
-    			append_dev(p0, br13);
-    			append_dev(p0, t236);
-    			append_dev(p0, br14);
+    			append_dev(p0, a0);
     			append_dev(p0, t237);
+    			append_dev(p0, br13);
+    			append_dev(p0, t238);
+    			append_dev(p0, br14);
+    			append_dev(p0, t239);
     			append_dev(p0, br15);
-    			insert_dev(target, t238, anchor);
+    			insert_dev(target, t240, anchor);
     			insert_dev(target, p1, anchor);
-    			append_dev(p1, t239);
+    			append_dev(p1, t241);
     			append_dev(p1, b1);
-    			append_dev(b1, a0);
-    			append_dev(b1, t241);
-    			append_dev(p1, t242);
-    			append_dev(p1, b2);
+    			append_dev(b1, a1);
+    			append_dev(b1, t243);
     			append_dev(p1, t244);
+    			append_dev(p1, b2);
+    			append_dev(p1, t246);
     			append_dev(p1, span16);
     			append_dev(span16, b3);
-    			append_dev(p1, t246);
+    			append_dev(p1, t248);
     			append_dev(p1, span17);
     			append_dev(span17, b4);
-    			append_dev(p1, t248);
+    			append_dev(p1, t250);
     			append_dev(p1, span18);
     			append_dev(span18, b5);
-    			append_dev(p1, t250);
-    			append_dev(p1, a1);
     			append_dev(p1, t252);
+    			append_dev(p1, i14);
+    			append_dev(i14, b6);
+    			append_dev(i14, t254);
+    			append_dev(i14, span19);
+    			append_dev(span19, b7);
+    			append_dev(i14, t256);
+    			append_dev(i14, span20);
+    			append_dev(span20, b8);
+    			append_dev(i14, t258);
+    			append_dev(i14, span21);
+    			append_dev(span21, b9);
+    			append_dev(i14, t260);
+    			append_dev(p1, t261);
     			append_dev(p1, a2);
-    			append_dev(p1, t254);
-    			append_dev(p1, span19);
-    			span19.innerHTML = /*ode_eqn*/ ctx[31];
-    			append_dev(p1, t255);
-    			insert_dev(target, t256, anchor);
-    			insert_dev(target, p2, anchor);
-    			append_dev(p2, t257);
-    			append_dev(p2, t258);
-    			append_dev(p2, t259);
-    			append_dev(p2, a3);
-    			append_dev(p2, t261);
-    			append_dev(p2, input12);
-    			set_input_value(input12, /*p_num_ind*/ ctx[32]);
-    			append_dev(p2, t262);
-    			append_dev(p2, t263);
-    			append_dev(p2, t264);
-    			append_dev(p2, a4);
-    			append_dev(p2, t266);
+    			append_dev(p1, t263);
+    			append_dev(p1, a3);
+    			append_dev(p1, t265);
+    			append_dev(p1, span22);
+    			span22.innerHTML = ctx.ode_eqn;
+    			append_dev(p1, t266);
     			insert_dev(target, t267, anchor);
+    			insert_dev(target, p2, anchor);
+    			append_dev(p2, t268);
+    			append_dev(p2, t269);
+    			append_dev(p2, t270);
+    			append_dev(p2, a4);
+    			append_dev(p2, t272);
+    			append_dev(p2, input12);
+
+    			set_input_value(input12, ctx.p_num_ind);
+
+    			append_dev(p2, t273);
+    			append_dev(p2, t274);
+    			append_dev(p2, t275);
+    			append_dev(p2, a5);
+    			append_dev(p2, t277);
+    			insert_dev(target, t278, anchor);
     			insert_dev(target, p3, anchor);
-    			insert_dev(target, t269, anchor);
+    			insert_dev(target, t280, anchor);
     			insert_dev(target, div119, anchor);
     			append_dev(div119, table);
     			append_dev(table, tr0);
     			append_dev(tr0, th0);
-    			append_dev(tr0, t270);
+    			append_dev(tr0, t281);
     			append_dev(tr0, th1);
-    			append_dev(tr0, t272);
+    			append_dev(tr0, t283);
     			append_dev(tr0, th2);
-    			append_dev(th2, t273);
+    			append_dev(th2, t284);
     			append_dev(th2, br16);
-    			append_dev(th2, t274);
+    			append_dev(th2, t285);
     			html_tag_3.m(th2);
-    			append_dev(tr0, t275);
+    			append_dev(tr0, t286);
     			append_dev(tr0, th3);
-    			append_dev(th3, t276);
+    			append_dev(th3, t287);
     			append_dev(th3, br17);
-    			append_dev(th3, t277);
+    			append_dev(th3, t288);
     			html_tag_4.m(th3);
-    			append_dev(th3, t278);
-    			append_dev(tr0, t279);
+    			append_dev(th3, t289);
+    			append_dev(tr0, t290);
     			append_dev(tr0, th4);
-    			append_dev(th4, t280);
+    			append_dev(th4, t291);
     			append_dev(th4, br18);
-    			append_dev(th4, t281);
+    			append_dev(th4, t292);
     			html_tag_5.m(th4);
-    			append_dev(th4, t282);
-    			append_dev(table, t283);
+    			append_dev(th4, t293);
+    			append_dev(table, t294);
     			append_dev(table, tr1);
     			append_dev(tr1, td0);
-    			append_dev(td0, a5);
-    			append_dev(tr1, t285);
+    			append_dev(td0, a6);
+    			append_dev(tr1, t296);
     			append_dev(tr1, td1);
-    			append_dev(tr1, t287);
+    			append_dev(tr1, t298);
     			append_dev(tr1, td2);
-    			append_dev(tr1, t289);
+    			append_dev(tr1, t300);
     			append_dev(tr1, td3);
-    			append_dev(tr1, t291);
+    			append_dev(tr1, t302);
     			append_dev(tr1, td4);
-    			append_dev(table, t293);
+    			append_dev(table, t304);
     			append_dev(table, tr2);
     			append_dev(tr2, td5);
-    			append_dev(td5, a6);
-    			append_dev(tr2, t295);
+    			append_dev(td5, a7);
+    			append_dev(tr2, t306);
     			append_dev(tr2, td6);
-    			append_dev(tr2, t297);
+    			append_dev(tr2, t308);
     			append_dev(tr2, td7);
-    			append_dev(tr2, t299);
+    			append_dev(tr2, t310);
     			append_dev(tr2, td8);
-    			append_dev(tr2, t301);
+    			append_dev(tr2, t312);
     			append_dev(tr2, td9);
-    			append_dev(table, t303);
+    			append_dev(table, t314);
     			append_dev(table, tr3);
     			append_dev(tr3, td10);
-    			append_dev(td10, a7);
-    			append_dev(tr3, t305);
+    			append_dev(td10, a8);
+    			append_dev(tr3, t316);
     			append_dev(tr3, td11);
-    			append_dev(tr3, t307);
+    			append_dev(tr3, t318);
     			append_dev(tr3, td12);
-    			append_dev(tr3, t309);
+    			append_dev(tr3, t320);
     			append_dev(tr3, td13);
-    			append_dev(tr3, t311);
+    			append_dev(tr3, t322);
     			append_dev(tr3, td14);
-    			append_dev(table, t313);
+    			append_dev(table, t324);
     			append_dev(table, tr4);
     			append_dev(tr4, td15);
-    			append_dev(td15, a8);
-    			append_dev(tr4, t315);
+    			append_dev(td15, a9);
+    			append_dev(tr4, t326);
     			append_dev(tr4, td16);
-    			append_dev(tr4, t317);
+    			append_dev(tr4, t328);
     			append_dev(tr4, td17);
-    			append_dev(tr4, t319);
+    			append_dev(tr4, t330);
     			append_dev(tr4, td18);
-    			append_dev(tr4, t320);
+    			append_dev(tr4, t331);
     			append_dev(tr4, td19);
-    			append_dev(table, t321);
+    			append_dev(table, t332);
     			append_dev(table, tr5);
     			append_dev(tr5, td20);
-    			append_dev(td20, a9);
-    			append_dev(tr5, t323);
+    			append_dev(td20, a10);
+    			append_dev(tr5, t334);
     			append_dev(tr5, td21);
-    			append_dev(tr5, t325);
+    			append_dev(tr5, t336);
     			append_dev(tr5, td22);
-    			append_dev(tr5, t327);
+    			append_dev(tr5, t338);
     			append_dev(tr5, td23);
-    			append_dev(tr5, t329);
+    			append_dev(tr5, t340);
     			append_dev(tr5, td24);
-    			append_dev(table, t330);
+    			append_dev(table, t341);
     			append_dev(table, tr6);
     			append_dev(tr6, td25);
-    			append_dev(td25, a10);
-    			append_dev(tr6, t332);
+    			append_dev(td25, a11);
+    			append_dev(tr6, t343);
     			append_dev(tr6, td26);
-    			append_dev(tr6, t334);
+    			append_dev(tr6, t345);
     			append_dev(tr6, td27);
-    			append_dev(tr6, t336);
+    			append_dev(tr6, t347);
     			append_dev(tr6, td28);
-    			append_dev(tr6, t338);
+    			append_dev(tr6, t349);
     			append_dev(tr6, td29);
-    			append_dev(table, t340);
+    			append_dev(table, t351);
     			append_dev(table, tr7);
     			append_dev(tr7, td30);
-    			append_dev(td30, a11);
-    			append_dev(tr7, t342);
+    			append_dev(td30, a12);
+    			append_dev(tr7, t353);
     			append_dev(tr7, td31);
-    			append_dev(tr7, t344);
+    			append_dev(tr7, t355);
     			append_dev(tr7, td32);
-    			append_dev(tr7, t346);
+    			append_dev(tr7, t357);
     			append_dev(tr7, td33);
-    			append_dev(tr7, t348);
+    			append_dev(tr7, t359);
     			append_dev(tr7, td34);
-    			append_dev(table, t350);
+    			append_dev(table, t361);
     			append_dev(table, tr8);
     			append_dev(tr8, td35);
-    			append_dev(td35, a12);
-    			append_dev(tr8, t352);
+    			append_dev(td35, a13);
+    			append_dev(tr8, t363);
     			append_dev(tr8, td36);
-    			append_dev(tr8, t354);
+    			append_dev(tr8, t365);
     			append_dev(tr8, td37);
-    			append_dev(tr8, t355);
+    			append_dev(tr8, t366);
     			append_dev(tr8, td38);
-    			append_dev(tr8, t357);
+    			append_dev(tr8, t368);
     			append_dev(tr8, td39);
-    			append_dev(table, t358);
+    			append_dev(table, t369);
     			append_dev(table, tr9);
     			append_dev(tr9, td40);
-    			append_dev(td40, a13);
-    			append_dev(tr9, t360);
+    			append_dev(td40, a14);
+    			append_dev(tr9, t371);
     			append_dev(tr9, td41);
-    			append_dev(tr9, t362);
+    			append_dev(tr9, t373);
     			append_dev(tr9, td42);
-    			append_dev(tr9, t364);
+    			append_dev(tr9, t375);
     			append_dev(tr9, td43);
-    			append_dev(tr9, t365);
+    			append_dev(tr9, t376);
     			append_dev(tr9, td44);
-    			append_dev(table, t366);
+    			append_dev(table, t377);
     			append_dev(table, tr10);
     			append_dev(tr10, td45);
-    			append_dev(td45, a14);
-    			append_dev(tr10, t368);
+    			append_dev(td45, a15);
+    			append_dev(tr10, t379);
     			append_dev(tr10, td46);
-    			append_dev(tr10, t370);
+    			append_dev(tr10, t381);
     			append_dev(tr10, td47);
-    			append_dev(tr10, t371);
+    			append_dev(tr10, t382);
     			append_dev(tr10, td48);
-    			append_dev(tr10, t373);
+    			append_dev(tr10, t384);
     			append_dev(tr10, td49);
-    			append_dev(tr10, t375);
+    			append_dev(tr10, t386);
     			append_dev(tr10, td50);
-    			append_dev(table, t376);
+    			append_dev(table, t387);
     			append_dev(table, tr11);
     			append_dev(tr11, td51);
-    			append_dev(td51, a15);
-    			append_dev(tr11, t378);
+    			append_dev(td51, a16);
+    			append_dev(tr11, t389);
     			append_dev(tr11, td52);
-    			append_dev(tr11, t380);
+    			append_dev(tr11, t391);
     			append_dev(tr11, td53);
-    			append_dev(tr11, t382);
+    			append_dev(tr11, t393);
     			append_dev(tr11, td54);
-    			append_dev(tr11, t383);
+    			append_dev(tr11, t394);
     			append_dev(tr11, td55);
-    			insert_dev(target, t384, anchor);
+    			insert_dev(target, t395, anchor);
     			insert_dev(target, p4, anchor);
-    			append_dev(p4, t385);
-    			append_dev(p4, a16);
-    			append_dev(p4, t387);
+    			append_dev(p4, t396);
     			append_dev(p4, a17);
-    			append_dev(p4, t389);
-    			insert_dev(target, t390, anchor);
+    			append_dev(p4, t398);
+    			append_dev(p4, a18);
+    			append_dev(p4, t400);
+    			insert_dev(target, t401, anchor);
     			insert_dev(target, p5, anchor);
-    			append_dev(p5, t391);
-    			append_dev(p5, a18);
-    			append_dev(p5, t393);
-    			append_dev(p5, a19);
-    			append_dev(p5, t395);
-    			append_dev(p5, a20);
-    			append_dev(p5, t397);
-    			insert_dev(target, t398, anchor);
+    			append_dev(p5, b10);
+    			append_dev(p5, br19);
+    			append_dev(p5, t403);
+    			html_tag_6.m(p5);
+    			append_dev(p5, t404);
+    			append_dev(p5, i15);
+    			append_dev(p5, t406);
+    			append_dev(p5, i16);
+    			append_dev(p5, t408);
+    			append_dev(p5, i17);
+    			append_dev(p5, t410);
+    			insert_dev(target, t411, anchor);
     			insert_dev(target, p6, anchor);
-    			append_dev(p6, b6);
-    			append_dev(p6, br19);
-    			append_dev(p6, t400);
-    			html_tag_6.m(p6);
-    			append_dev(p6, t401);
-    			append_dev(p6, i14);
-    			append_dev(p6, t403);
-    			append_dev(p6, i15);
-    			append_dev(p6, t405);
-    			append_dev(p6, i16);
-    			append_dev(p6, t407);
-    			insert_dev(target, t408, anchor);
-    			insert_dev(target, p7, anchor);
-    			append_dev(p7, b7);
-    			append_dev(p7, br20);
-    			append_dev(p7, t410);
-    			append_dev(p7, a21);
-    			append_dev(p7, t412);
-    			append_dev(p7, a22);
-    			append_dev(p7, t414);
-    			append_dev(p7, a23);
-    			append_dev(p7, t416);
-    			append_dev(p7, a24);
-    			append_dev(p7, t418);
-    			insert_dev(target, t419, anchor);
+    			append_dev(p6, b11);
+    			append_dev(p6, br20);
+    			append_dev(p6, t413);
+    			append_dev(p6, a19);
+    			append_dev(p6, t415);
+    			append_dev(p6, a20);
+    			append_dev(p6, t417);
+    			append_dev(p6, a21);
+    			append_dev(p6, t419);
+    			append_dev(p6, a22);
+    			append_dev(p6, t421);
+    			insert_dev(target, t422, anchor);
     			insert_dev(target, div122, anchor);
     			append_dev(div122, div121);
     			append_dev(div121, div120);
-    			append_dev(div121, t421);
+    			append_dev(div121, t424);
     			append_dev(div121, form);
     			append_dev(form, textarea);
     			current = true;
-    			if (remount) run_all(dispose);
-
-    			dispose = [
-    				listen_dev(div64, "mousedown", /*lock_yaxis*/ ctx[37], false, false, false),
-    				listen_dev(input0, "change", /*input0_change_input_handler*/ ctx[71]),
-    				listen_dev(input0, "input", /*input0_change_input_handler*/ ctx[71]),
-    				listen_dev(input0, "mousedown", /*lock_yaxis*/ ctx[37], false, false, false),
-    				listen_dev(input1, "change", /*input1_change_input_handler*/ ctx[73]),
-    				listen_dev(input1, "input", /*input1_change_input_handler*/ ctx[73]),
-    				listen_dev(input2, "change", /*input2_change_input_handler*/ ctx[74]),
-    				listen_dev(input2, "input", /*input2_change_input_handler*/ ctx[74]),
-    				listen_dev(input3, "change", /*input3_change_input_handler*/ ctx[75]),
-    				listen_dev(input3, "input", /*input3_change_input_handler*/ ctx[75]),
-    				listen_dev(input4, "change", /*input4_change_input_handler*/ ctx[76]),
-    				listen_dev(input4, "input", /*input4_change_input_handler*/ ctx[76]),
-    				listen_dev(input5, "change", /*input5_change_input_handler*/ ctx[77]),
-    				listen_dev(input5, "input", /*input5_change_input_handler*/ ctx[77]),
-    				listen_dev(input6, "change", /*input6_change_input_handler*/ ctx[78]),
-    				listen_dev(input6, "input", /*input6_change_input_handler*/ ctx[78]),
-    				listen_dev(input7, "change", /*input7_change_input_handler*/ ctx[79]),
-    				listen_dev(input7, "input", /*input7_change_input_handler*/ ctx[79]),
-    				listen_dev(input8, "change", /*input8_change_input_handler*/ ctx[80]),
-    				listen_dev(input8, "input", /*input8_change_input_handler*/ ctx[80]),
-    				listen_dev(input9, "change", /*input9_change_input_handler*/ ctx[81]),
-    				listen_dev(input9, "input", /*input9_change_input_handler*/ ctx[81]),
-    				listen_dev(input10, "change", /*input10_change_input_handler*/ ctx[82]),
-    				listen_dev(input10, "input", /*input10_change_input_handler*/ ctx[82]),
-    				listen_dev(input11, "change", /*input11_change_input_handler*/ ctx[83]),
-    				listen_dev(input11, "input", /*input11_change_input_handler*/ ctx[83]),
-    				listen_dev(input12, "input", /*input12_input_handler*/ ctx[84])
-    			];
     		},
-    		p: function update(ctx, dirty) {
-    			if ((!current || dirty[0] & /*indexToTime, active_*/ 1342177280) && t5_value !== (t5_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "")) set_data_dev(t5, t5_value);
-    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t13_value !== (t13_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0])) + "")) set_data_dev(t13, t13_value);
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t15_value !== (t15_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][0]).toFixed(2) + "")) set_data_dev(t15, t15_value);
-    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t20_value !== (t20_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[0])) + "")) set_data_dev(t20, t20_value);
-    			const checkbox1_changes = {};
 
-    			if (!updating_checked && dirty[0] & /*checked*/ 33554432) {
-    				updating_checked = true;
-    				checkbox1_changes.checked = /*checked*/ ctx[25][4];
-    				add_flush_callback(() => updating_checked = false);
+    		p: function update(changed, ctx) {
+    			if ((!current || changed.indexToTime || changed.active_) && t5_value !== (t5_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "")) {
+    				set_data_dev(t5, t5_value);
     			}
 
+    			if ((!current || changed.N || changed.Iters || changed.active_) && t13_value !== (t13_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][0])) + "")) {
+    				set_data_dev(t13, t13_value);
+    			}
+
+    			if ((!current || changed.Iters || changed.active_) && t15_value !== (t15_value = (100*ctx.Iters[ctx.active_][0]).toFixed(2) + "")) {
+    				set_data_dev(t15, t15_value);
+    			}
+
+    			if ((!current || changed.N || changed.get_d || changed.active_) && t20_value !== (t20_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[0])) + "")) {
+    				set_data_dev(t20, t20_value);
+    			}
+
+    			var checkbox1_changes = {};
+    			if (!updating_checked && changed.checked) {
+    				checkbox1_changes.checked = ctx.checked[4];
+    			}
     			checkbox1.$set(checkbox1_changes);
-    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t31_value !== (t31_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1])) + "")) set_data_dev(t31, t31_value);
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t33_value !== (t33_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][1]).toFixed(2) + "")) set_data_dev(t33, t33_value);
-    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t38_value !== (t38_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[1])) + "")) set_data_dev(t38, t38_value);
-    			const checkbox2_changes = {};
 
-    			if (!updating_checked_1 && dirty[0] & /*checked*/ 33554432) {
-    				updating_checked_1 = true;
-    				checkbox2_changes.checked = /*checked*/ ctx[25][3];
-    				add_flush_callback(() => updating_checked_1 = false);
+    			if ((!current || changed.N || changed.Iters || changed.active_) && t31_value !== (t31_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][1])) + "")) {
+    				set_data_dev(t31, t31_value);
     			}
 
+    			if ((!current || changed.Iters || changed.active_) && t33_value !== (t33_value = (100*ctx.Iters[ctx.active_][1]).toFixed(2) + "")) {
+    				set_data_dev(t33, t33_value);
+    			}
+
+    			if ((!current || changed.N || changed.get_d || changed.active_) && t38_value !== (t38_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[1])) + "")) {
+    				set_data_dev(t38, t38_value);
+    			}
+
+    			var checkbox2_changes = {};
+    			if (!updating_checked_1 && changed.checked) {
+    				checkbox2_changes.checked = ctx.checked[3];
+    			}
     			checkbox2.$set(checkbox2_changes);
-    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t49_value !== (t49_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2])) + "")) set_data_dev(t49, t49_value);
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t51_value !== (t51_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]).toFixed(2) + "")) set_data_dev(t51, t51_value);
-    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t56_value !== (t56_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[2])) + "")) set_data_dev(t56, t56_value);
-    			const checkbox3_changes = {};
-    			if (dirty[0] & /*checked*/ 33554432) checkbox3_changes.callback = /*func*/ ctx[65];
+
+    			if ((!current || changed.N || changed.Iters || changed.active_) && t49_value !== (t49_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][2])) + "")) {
+    				set_data_dev(t49, t49_value);
+    			}
+
+    			if ((!current || changed.Iters || changed.active_) && t51_value !== (t51_value = (100*ctx.Iters[ctx.active_][2]).toFixed(2) + "")) {
+    				set_data_dev(t51, t51_value);
+    			}
+
+    			if ((!current || changed.N || changed.get_d || changed.active_) && t56_value !== (t56_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[2])) + "")) {
+    				set_data_dev(t56, t56_value);
+    			}
+
+    			var checkbox3_changes = {};
+    			if (changed.checked) checkbox3_changes.callback = ctx.func;
     			checkbox3.$set(checkbox3_changes);
-    			if ((!current || dirty[0] & /*N, Iters, active_, I0*/ 1082130456) && t69_value !== (t69_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2]) + /*I0*/ ctx[4])) + "")) set_data_dev(t69, t69_value);
-    			if ((!current || dirty[0] & /*Iters, active_, I0, N*/ 1082130456) && t71_value !== (t71_value = (100 * (1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][0] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][1] - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] - /*I0*/ ctx[4] / /*N*/ ctx[3])).toFixed(2) + "")) set_data_dev(t71, t71_value);
-    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t76_value !== (t76_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[3] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[4] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[7]))) + "")) set_data_dev(t76, t76_value);
-    			const checkbox4_changes = {};
 
-    			if (!updating_checked_2 && dirty[0] & /*checked*/ 33554432) {
-    				updating_checked_2 = true;
-    				checkbox4_changes.checked = /*checked*/ ctx[25][2];
-    				add_flush_callback(() => updating_checked_2 = false);
+    			if ((!current || changed.N || changed.Iters || changed.active_ || changed.I0) && t69_value !== (t69_value = formatNumber$1(ctx.Math.round(ctx.N* (1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2])+ctx.I0 )) + "")) {
+    				set_data_dev(t69, t69_value);
     			}
 
+    			if ((!current || changed.Iters || changed.active_ || changed.I0 || changed.N) && t71_value !== (t71_value = ((100*(1-ctx.Iters[ctx.active_][0]-ctx.Iters[ctx.active_][1]-ctx.Iters[ctx.active_][2]-ctx.I0/ctx.N))).toFixed(2) + "")) {
+    				set_data_dev(t71, t71_value);
+    			}
+
+    			if ((!current || changed.N || changed.get_d || changed.active_) && t76_value !== (t76_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[3]+ctx.get_d(ctx.active_)[4]+ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]+ctx.get_d(ctx.active_)[7]) )) + "")) {
+    				set_data_dev(t76, t76_value);
+    			}
+
+    			var checkbox4_changes = {};
+    			if (!updating_checked_2 && changed.checked) {
+    				checkbox4_changes.checked = ctx.checked[2];
+    			}
     			checkbox4.$set(checkbox4_changes);
-    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t87_value !== (t87_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8]))) + "")) set_data_dev(t87, t87_value);
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t89_value !== (t89_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][7] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][8])).toFixed(2) + "")) set_data_dev(t89, t89_value);
-    			const checkbox5_changes = {};
 
-    			if (!updating_checked_3 && dirty[0] & /*checked*/ 33554432) {
-    				updating_checked_3 = true;
-    				checkbox5_changes.checked = /*checked*/ ctx[25][1];
-    				add_flush_callback(() => updating_checked_3 = false);
+    			if ((!current || changed.N || changed.Iters || changed.active_) && t87_value !== (t87_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8]) )) + "")) {
+    				set_data_dev(t87, t87_value);
     			}
 
+    			if ((!current || changed.Iters || changed.active_) && t89_value !== (t89_value = (100*(ctx.Iters[ctx.active_][7]+ctx.Iters[ctx.active_][8])).toFixed(2) + "")) {
+    				set_data_dev(t89, t89_value);
+    			}
+
+    			var checkbox5_changes = {};
+    			if (!updating_checked_3 && changed.checked) {
+    				checkbox5_changes.checked = ctx.checked[1];
+    			}
     			checkbox5.$set(checkbox5_changes);
-    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t100_value !== (t100_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6]))) + "")) set_data_dev(t100, t100_value);
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t102_value !== (t102_value = (100 * (/*Iters*/ ctx[23][/*active_*/ ctx[30]][5] + /*Iters*/ ctx[23][/*active_*/ ctx[30]][6])).toFixed(2) + "")) set_data_dev(t102, t102_value);
-    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t107_value !== (t107_value = formatNumber$1(Math.round(/*N*/ ctx[3] * (/*get_d*/ ctx[33](/*active_*/ ctx[30])[5] + /*get_d*/ ctx[33](/*active_*/ ctx[30])[6]))) + "")) set_data_dev(t107, t107_value);
-    			const checkbox6_changes = {};
 
-    			if (!updating_checked_4 && dirty[0] & /*checked*/ 33554432) {
-    				updating_checked_4 = true;
-    				checkbox6_changes.checked = /*checked*/ ctx[25][0];
-    				add_flush_callback(() => updating_checked_4 = false);
+    			if ((!current || changed.N || changed.Iters || changed.active_) && t100_value !== (t100_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6]) )) + "")) {
+    				set_data_dev(t100, t100_value);
     			}
 
+    			if ((!current || changed.Iters || changed.active_) && t102_value !== (t102_value = (100*(ctx.Iters[ctx.active_][5]+ctx.Iters[ctx.active_][6])).toFixed(2) + "")) {
+    				set_data_dev(t102, t102_value);
+    			}
+
+    			if ((!current || changed.N || changed.get_d || changed.active_) && t107_value !== (t107_value = formatNumber$1(ctx.Math.round(ctx.N*(ctx.get_d(ctx.active_)[5]+ctx.get_d(ctx.active_)[6]))) + "")) {
+    				set_data_dev(t107, t107_value);
+    			}
+
+    			var checkbox6_changes = {};
+    			if (!updating_checked_4 && changed.checked) {
+    				checkbox6_changes.checked = ctx.checked[0];
+    			}
     			checkbox6.$set(checkbox6_changes);
-    			if ((!current || dirty[0] & /*N, Iters, active_*/ 1082130440) && t118_value !== (t118_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9])) + "")) set_data_dev(t118, t118_value);
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432) && t120_value !== (t120_value = (100 * /*Iters*/ ctx[23][/*active_*/ ctx[30]][9]).toFixed(2) + "")) set_data_dev(t120, t120_value);
-    			if ((!current || dirty[0] & /*N, active_*/ 1073741832 | dirty[1] & /*get_d*/ 4) && t125_value !== (t125_value = formatNumber$1(Math.round(/*N*/ ctx[3] * /*get_d*/ ctx[33](/*active_*/ ctx[30])[9])) + "")) set_data_dev(t125, t125_value);
-    			const chart_changes = {};
-    			if (dirty[0] & /*P*/ 131072) chart_changes.y = /*P*/ ctx[17];
-    			if (dirty[0] & /*Xmax*/ 16384) chart_changes.xmax = /*Xmax*/ ctx[14];
-    			if (dirty[0] & /*total_infected*/ 4194304) chart_changes.total_infected = /*total_infected*/ ctx[22];
-    			if (dirty[0] & /*deaths*/ 1048576) chart_changes.deaths = /*deaths*/ ctx[20];
-    			if (dirty[0] & /*total*/ 2097152) chart_changes.total = /*total*/ ctx[21];
-    			if (dirty[0] & /*timestep*/ 262144) chart_changes.timestep = /*timestep*/ ctx[18];
-    			if (dirty[0] & /*tmax*/ 524288) chart_changes.tmax = /*tmax*/ ctx[19];
-    			if (dirty[0] & /*N*/ 8) chart_changes.N = /*N*/ ctx[3];
-    			if (dirty[0] & /*lock, Plock, Pmax*/ 83886081) chart_changes.ymax = /*lock*/ ctx[26] ? /*Plock*/ ctx[0] : /*Pmax*/ ctx[24];
-    			if (dirty[0] & /*InterventionTime*/ 4096) chart_changes.InterventionTime = /*InterventionTime*/ ctx[12];
-    			if (dirty[1] & /*log*/ 16) chart_changes.log = !/*log*/ ctx[35];
 
-    			if (!updating_checked_5 && dirty[0] & /*checked*/ 33554432) {
-    				updating_checked_5 = true;
-    				chart_changes.checked = /*checked*/ ctx[25];
-    				add_flush_callback(() => updating_checked_5 = false);
+    			if ((!current || changed.N || changed.Iters || changed.active_) && t118_value !== (t118_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.Iters[ctx.active_][9])) + "")) {
+    				set_data_dev(t118, t118_value);
     			}
 
-    			if (!updating_active && dirty[0] & /*active*/ 536870912) {
-    				updating_active = true;
-    				chart_changes.active = /*active*/ ctx[29];
-    				add_flush_callback(() => updating_active = false);
+    			if ((!current || changed.Iters || changed.active_) && t120_value !== (t120_value = (100*ctx.Iters[ctx.active_][9]).toFixed(2) + "")) {
+    				set_data_dev(t120, t120_value);
     			}
 
+    			if ((!current || changed.N || changed.get_d || changed.active_) && t125_value !== (t125_value = formatNumber$1(ctx.Math.round(ctx.N*ctx.get_d(ctx.active_)[9])) + "")) {
+    				set_data_dev(t125, t125_value);
+    			}
+
+    			var chart_changes = {};
+    			if (changed.P) chart_changes.y = ctx.P;
+    			if (changed.Xmax) chart_changes.xmax = ctx.Xmax;
+    			if (changed.total_infected) chart_changes.total_infected = ctx.total_infected;
+    			if (changed.deaths) chart_changes.deaths = ctx.deaths;
+    			if (changed.total) chart_changes.total = ctx.total;
+    			if (changed.timestep) chart_changes.timestep = ctx.timestep;
+    			if (changed.tmax) chart_changes.tmax = ctx.tmax;
+    			if (changed.N) chart_changes.N = ctx.N;
+    			if (changed.lock || changed.Plock || changed.Pmax) chart_changes.ymax = ctx.lock ? ctx.Plock: ctx.Pmax;
+    			if (changed.InterventionTime) chart_changes.InterventionTime = ctx.InterventionTime;
+    			if (changed.log) chart_changes.log = !ctx.log;
+    			if (!updating_checked_5 && changed.checked) {
+    				chart_changes.checked = ctx.checked;
+    			}
+    			if (!updating_active && changed.active) {
+    				chart_changes.active = ctx.active;
+    			}
     			chart.$set(chart_changes);
-    			if ((!current || dirty[0] & /*R0, InterventionAmt*/ 8224) && raw0_value !== (raw0_value = math_inline("\\mathcal{R}_t=" + (/*R0*/ ctx[5] * /*InterventionAmt*/ ctx[13]).toFixed(2)) + "")) span14.innerHTML = raw0_value;			if (dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) show_if = /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 100;
+
+    			if ((!current || changed.R0 || changed.InterventionAmt) && raw0_value !== (raw0_value = math_inline("\\mathcal{R}_t=" + (ctx.R0*ctx.InterventionAmt).toFixed(2) ) + "")) {
+    				span14.innerHTML = raw0_value;
+    			}
+
+    			if (changed.xScaleTime || changed.InterventionTime) show_if = ctx.xScaleTime(ctx.InterventionTime) >= 100;
 
     			if (show_if) {
     				if (if_block) {
-    					if_block.p(ctx, dirty);
+    					if_block.p(changed, ctx);
     				} else {
     					if_block = create_if_block$1(ctx);
     					if_block.c();
@@ -26321,44 +25379,35 @@
     				if_block = null;
     			}
 
-    			if ((!current || dirty[0] & /*InterventionTime*/ 4096) && t137_value !== (t137_value = format("d")(/*InterventionTime*/ ctx[12]) + "")) set_data_dev(t137, t137_value);
-
-    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
-    				set_style(div60, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
+    			if ((!current || changed.InterventionTime) && t137_value !== (t137_value = format("d")(ctx.InterventionTime) + "")) {
+    				set_data_dev(t137, t137_value);
     			}
 
-    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
-    				set_style(div60, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
-    				? "visible"
-    				: "hidden");
+    			if (!current || changed.xScaleTime || changed.InterventionTime) {
+    				set_style(div60, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
+    				set_style(div60, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
     			}
 
-    			if ((!current || dirty[0] & /*InterventionAmt*/ 8192) && t145_value !== (t145_value = /*InterventionAmt*/ ctx[13].toFixed(2) + "")) set_data_dev(t145, t145_value);
-
-    			if (dirty[0] & /*InterventionAmt*/ 8192) {
-    				set_input_value(input0, /*InterventionAmt*/ ctx[13]);
+    			if ((!current || changed.InterventionAmt) && t145_value !== (t145_value = (ctx.InterventionAmt).toFixed(2) + "")) {
+    				set_data_dev(t145, t145_value);
     			}
 
-    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
-    				set_style(div68, "left", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) + "px");
+    			if (changed.InterventionAmt) set_input_value(input0, ctx.InterventionAmt);
+
+    			if (!current || changed.xScaleTime || changed.InterventionTime) {
+    				set_style(div68, "left", "" + ctx.xScaleTime(ctx.InterventionTime) + "px");
+    				set_style(div68, "visibility", ((ctx.xScaleTime(ctx.InterventionTime) < (width$1 - ctx.padding.right)) ? 'visible':'hidden'));
     			}
 
-    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
-    				set_style(div68, "visibility", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) < /*width*/ ctx[39] - /*padding*/ ctx[38].right
-    				? "visible"
-    				: "hidden");
-    			}
+    			if (changed.xScaleTime || changed.milestones) {
+    				each_value = ctx.milestones;
 
-    			if (dirty[0] & /*xScaleTime*/ 134217728 | dirty[1] & /*milestones*/ 8) {
-    				each_value = /*milestones*/ ctx[34];
-    				validate_each_argument(each_value);
     				let i;
-
     				for (i = 0; i < each_value.length; i += 1) {
     					const child_ctx = get_each_context$1(ctx, each_value, i);
 
     					if (each_blocks[i]) {
-    						each_blocks[i].p(child_ctx, dirty);
+    						each_blocks[i].p(changed, child_ctx);
     						transition_in(each_blocks[i], 1);
     					} else {
     						each_blocks[i] = create_each_block$1(child_ctx);
@@ -26369,132 +25418,145 @@
     				}
 
     				group_outros();
-
     				for (i = each_value.length; i < each_blocks.length; i += 1) {
     					out(i);
     				}
-
     				check_outros();
     			}
 
-    			const checkbox7_changes = {};
-
-    			if (!updating_checked_6 && dirty[1] & /*log*/ 16) {
-    				updating_checked_6 = true;
-    				checkbox7_changes.checked = /*log*/ ctx[35];
-    				add_flush_callback(() => updating_checked_6 = false);
+    			var checkbox7_changes = {};
+    			if (!updating_checked_6 && changed.log) {
+    				checkbox7_changes.checked = ctx.log;
     			}
-
     			checkbox7.$set(checkbox7_changes);
 
-    			if (!current || dirty[0] & /*xScaleTime, InterventionTime*/ 134221824) {
-    				set_style(div73, "opacity", /*xScaleTime*/ ctx[27](/*InterventionTime*/ ctx[12]) >= 192
-    				? 1
-    				: 0.2);
+    			if (!current || changed.xScaleTime || changed.InterventionTime) {
+    				set_style(div73, "opacity", (ctx.xScaleTime(ctx.InterventionTime) >= 192? 1.0 : 0.2));
     			}
 
-    			if ((!current || dirty[0] & /*N*/ 8) && t160_value !== (t160_value = format(",")(Math.round(/*N*/ ctx[3])) + "")) set_data_dev(t160, t160_value);
-
-    			if (dirty[0] & /*logN*/ 4) {
-    				set_input_value(input1, /*logN*/ ctx[2]);
+    			if ((!current || changed.N) && t160_value !== (t160_value = format(",")(ctx.Math.round(ctx.N)) + "")) {
+    				set_data_dev(t160, t160_value);
     			}
 
-    			if (!current || dirty[0] & /*I0*/ 16) set_data_dev(t165, /*I0*/ ctx[4]);
+    			if (changed.logN) set_input_value(input1, ctx.logN);
 
-    			if (dirty[0] & /*I0*/ 16) {
-    				set_input_value(input2, /*I0*/ ctx[4]);
+    			if (!current || changed.I0) {
+    				set_data_dev(t165, ctx.I0);
     			}
 
-    			if (!current || dirty[0] & /*R0*/ 32) set_data_dev(t172, /*R0*/ ctx[5]);
+    			if (changed.I0) set_input_value(input2, ctx.I0);
 
-    			if (dirty[0] & /*R0*/ 32) {
-    				set_input_value(input3, /*R0*/ ctx[5]);
+    			if (!current || changed.R0) {
+    				set_data_dev(t172, ctx.R0);
     			}
 
-    			if ((!current || dirty[0] & /*D_incbation*/ 64) && t180_value !== (t180_value = /*D_incbation*/ ctx[6].toFixed(2) + "")) set_data_dev(t180, t180_value);
+    			if (changed.R0) set_input_value(input3, ctx.R0);
 
-    			if (dirty[0] & /*D_incbation*/ 64) {
-    				set_input_value(input4, /*D_incbation*/ ctx[6]);
+    			if ((!current || changed.D_incbation) && t180_value !== (t180_value = (ctx.D_incbation).toFixed(2) + "")) {
+    				set_data_dev(t180, t180_value);
     			}
 
-    			if (!current || dirty[0] & /*D_infectious*/ 128) set_data_dev(t187, /*D_infectious*/ ctx[7]);
+    			if (changed.D_incbation) set_input_value(input4, ctx.D_incbation);
 
-    			if (dirty[0] & /*D_infectious*/ 128) {
-    				set_input_value(input5, /*D_infectious*/ ctx[7]);
+    			if (!current || changed.D_infectious) {
+    				set_data_dev(t187, ctx.D_infectious);
     			}
 
-    			if ((!current || dirty[0] & /*CFR*/ 2048) && t196_value !== (t196_value = (/*CFR*/ ctx[11] * 100).toFixed(2) + "")) set_data_dev(t196, t196_value);
+    			if (changed.D_infectious) set_input_value(input5, ctx.D_infectious);
 
-    			if (dirty[0] & /*CFR*/ 2048) {
-    				set_input_value(input6, /*CFR*/ ctx[11]);
+    			if ((!current || changed.CFR) && t196_value !== (t196_value = (ctx.CFR*100).toFixed(2) + "")) {
+    				set_data_dev(t196, t196_value);
     			}
 
-    			if (!current || dirty[0] & /*Time_to_death*/ 2) set_data_dev(t202, /*Time_to_death*/ ctx[1]);
+    			if (changed.CFR) set_input_value(input6, ctx.CFR);
 
-    			if (!current || dirty[0] & /*D_infectious*/ 128 && input7_min_value !== (input7_min_value = /*D_infectious*/ ctx[7] + 0.1)) {
+    			if (!current || changed.Time_to_death) {
+    				set_data_dev(t202, ctx.Time_to_death);
+    			}
+
+    			if (changed.Time_to_death) set_input_value(input7, ctx.Time_to_death);
+
+    			if ((!current || changed.D_infectious) && input7_min_value !== (input7_min_value = (ctx.D_infectious)+0.1)) {
     				attr_dev(input7, "min", input7_min_value);
     			}
 
-    			if (dirty[0] & /*Time_to_death*/ 2) {
-    				set_input_value(input7, /*Time_to_death*/ ctx[1]);
+    			if (!current || changed.D_recovery_severe) {
+    				set_data_dev(t210, ctx.D_recovery_severe);
     			}
 
-    			if (!current || dirty[0] & /*D_recovery_severe*/ 512) set_data_dev(t210, /*D_recovery_severe*/ ctx[9]);
+    			if (changed.D_recovery_severe) set_input_value(input8, ctx.D_recovery_severe);
 
-    			if (dirty[0] & /*D_recovery_severe*/ 512) {
-    				set_input_value(input8, /*D_recovery_severe*/ ctx[9]);
+    			if (!current || changed.D_recovery_mild) {
+    				set_data_dev(t216, ctx.D_recovery_mild);
     			}
 
-    			if (!current || dirty[0] & /*D_recovery_mild*/ 256) set_data_dev(t216, /*D_recovery_mild*/ ctx[8]);
+    			if (changed.D_recovery_mild) set_input_value(input9, ctx.D_recovery_mild);
 
-    			if (dirty[0] & /*D_recovery_mild*/ 256) {
-    				set_input_value(input9, /*D_recovery_mild*/ ctx[8]);
+    			if ((!current || changed.P_SEVERE) && t224_value !== (t224_value = (ctx.P_SEVERE*100).toFixed(2) + "")) {
+    				set_data_dev(t224, t224_value);
     			}
 
-    			if ((!current || dirty[0] & /*P_SEVERE*/ 32768) && t224_value !== (t224_value = (/*P_SEVERE*/ ctx[15] * 100).toFixed(2) + "")) set_data_dev(t224, t224_value);
+    			if (changed.P_SEVERE) set_input_value(input10, ctx.P_SEVERE);
 
-    			if (dirty[0] & /*P_SEVERE*/ 32768) {
-    				set_input_value(input10, /*P_SEVERE*/ ctx[15]);
+    			if (!current || changed.D_hospital_lag) {
+    				set_data_dev(t230, ctx.D_hospital_lag);
     			}
 
-    			if (!current || dirty[0] & /*D_hospital_lag*/ 1024) set_data_dev(t230, /*D_hospital_lag*/ ctx[10]);
+    			if (changed.D_hospital_lag) set_input_value(input11, ctx.D_hospital_lag);
 
-    			if (dirty[0] & /*D_hospital_lag*/ 1024) {
-    				set_input_value(input11, /*D_hospital_lag*/ ctx[10]);
+    			if (!current || changed.ode_eqn) {
+    				span22.innerHTML = ctx.ode_eqn;
     			}
 
-    			if (!current || dirty[1] & /*ode_eqn*/ 1) span19.innerHTML = /*ode_eqn*/ ctx[31];			if ((!current || dirty[0] & /*indexToTime, active_*/ 1342177280) && t258_value !== (t258_value = Math.round(/*indexToTime*/ ctx[28](/*active_*/ ctx[30])) + "")) set_data_dev(t258, t258_value);
-
-    			if (!current || dirty[1] & /*p_num_ind*/ 2) {
-    				set_style(input12, "width", Math.ceil(Math.log10(/*p_num_ind*/ ctx[32])) * 9.5 + 5 + "px");
+    			if ((!current || changed.indexToTime || changed.active_) && t269_value !== (t269_value = ctx.Math.round(ctx.indexToTime(ctx.active_)) + "")) {
+    				set_data_dev(t269, t269_value);
     			}
 
-    			if (dirty[1] & /*p_num_ind*/ 2 && input12.value !== /*p_num_ind*/ ctx[32]) {
-    				set_input_value(input12, /*p_num_ind*/ ctx[32]);
+    			if (changed.p_num_ind && (input12.value !== ctx.p_num_ind)) set_input_value(input12, ctx.p_num_ind);
+
+    			if (!current || changed.p_num_ind) {
+    				set_style(input12, "width", "" + (ctx.Math.ceil(ctx.Math.log10(ctx.p_num_ind))*9.5 + 5) + "px");
     			}
 
-    			if ((!current || dirty[0] & /*Iters, active_*/ 1082130432 | dirty[1] & /*p_num_ind*/ 2) && t263_value !== (t263_value = ((1 - Math.pow(1 - /*Iters*/ ctx[23][/*active_*/ ctx[30]][2] * (0.45 / 100), /*p_num_ind*/ ctx[32])) * 100).toFixed(5) + "")) set_data_dev(t263, t263_value);
+    			if ((!current || changed.Iters || changed.active_ || changed.p_num_ind) && t274_value !== (t274_value = ((1-(ctx.Math.pow(1 - (ctx.Iters[ctx.active_][2])*(0.45/100), ctx.p_num_ind)))*100).toFixed(5) + "")) {
+    				set_data_dev(t274, t274_value);
+    			}
 
-    			if (!current || dirty[0] & /*state*/ 65536) {
-    				prop_dev(textarea, "value", /*state*/ ctx[16]);
+    			if (!current || changed.state) {
+    				prop_dev(textarea, "value", ctx.state);
     			}
     		},
+
     		i: function intro(local) {
     			if (current) return;
     			transition_in(checkbox0.$$.fragment, local);
+
     			transition_in(arrow0.$$.fragment, local);
+
     			transition_in(checkbox1.$$.fragment, local);
+
     			transition_in(arrow1.$$.fragment, local);
+
     			transition_in(checkbox2.$$.fragment, local);
+
     			transition_in(arrow2.$$.fragment, local);
+
     			transition_in(checkbox3.$$.fragment, local);
+
     			transition_in(arrow3.$$.fragment, local);
+
     			transition_in(checkbox4.$$.fragment, local);
+
     			transition_in(arrow4.$$.fragment, local);
+
     			transition_in(arrow5.$$.fragment, local);
+
     			transition_in(checkbox5.$$.fragment, local);
+
     			transition_in(arrow6.$$.fragment, local);
+
     			transition_in(checkbox6.$$.fragment, local);
+
     			transition_in(chart.$$.fragment, local);
 
     			for (let i = 0; i < each_value.length; i += 1) {
@@ -26502,8 +25564,10 @@
     			}
 
     			transition_in(checkbox7.$$.fragment, local);
+
     			current = true;
     		},
+
     		o: function outro(local) {
     			transition_out(checkbox0.$$.fragment, local);
     			transition_out(arrow0.$$.fragment, local);
@@ -26520,8 +25584,8 @@
     			transition_out(arrow6.$$.fragment, local);
     			transition_out(checkbox6.$$.fragment, local);
     			transition_out(chart.$$.fragment, local);
-    			each_blocks = each_blocks.filter(Boolean);
 
+    			each_blocks = each_blocks.filter(Boolean);
     			for (let i = 0; i < each_blocks.length; i += 1) {
     				transition_out(each_blocks[i]);
     			}
@@ -26529,880 +25593,625 @@
     			transition_out(checkbox7.$$.fragment, local);
     			current = false;
     		},
+
     		d: function destroy(detaching) {
-    			if (detaching) detach_dev(link);
-    			if (detaching) detach_dev(t0);
-    			if (detaching) detach_dev(h2);
-    			if (detaching) detach_dev(t2);
-    			if (detaching) detach_dev(div75);
+    			if (detaching) {
+    				detach_dev(link);
+    				detach_dev(t0);
+    				detach_dev(h2);
+    				detach_dev(t2);
+    				detach_dev(div75);
+    			}
+
     			destroy_component(checkbox0);
+
     			destroy_component(arrow0);
+
     			destroy_component(checkbox1);
+
     			destroy_component(arrow1);
+
     			destroy_component(checkbox2);
+
     			destroy_component(arrow2);
+
     			destroy_component(checkbox3);
+
     			destroy_component(arrow3);
+
     			destroy_component(checkbox4);
+
     			destroy_component(arrow4);
+
     			destroy_component(arrow5);
+
     			destroy_component(checkbox5);
+
     			destroy_component(arrow6);
+
     			destroy_component(checkbox6);
+
     			destroy_component(chart);
+
     			if (if_block) if_block.d();
+
     			destroy_each(each_blocks, detaching);
+
     			destroy_component(checkbox7);
-    			if (detaching) detach_dev(t150);
-    			if (detaching) detach_dev(div117);
-    			if (detaching) detach_dev(t233);
-    			if (detaching) detach_dev(div118);
-    			if (detaching) detach_dev(t234);
-    			if (detaching) detach_dev(p0);
-    			if (detaching) detach_dev(t238);
-    			if (detaching) detach_dev(p1);
-    			if (detaching) detach_dev(t256);
-    			if (detaching) detach_dev(p2);
-    			if (detaching) detach_dev(t267);
-    			if (detaching) detach_dev(p3);
-    			if (detaching) detach_dev(t269);
-    			if (detaching) detach_dev(div119);
-    			if (detaching) detach_dev(t384);
-    			if (detaching) detach_dev(p4);
-    			if (detaching) detach_dev(t390);
-    			if (detaching) detach_dev(p5);
-    			if (detaching) detach_dev(t398);
-    			if (detaching) detach_dev(p6);
-    			if (detaching) detach_dev(t408);
-    			if (detaching) detach_dev(p7);
-    			if (detaching) detach_dev(t419);
-    			if (detaching) detach_dev(div122);
+
+    			if (detaching) {
+    				detach_dev(t150);
+    				detach_dev(div117);
+    				detach_dev(t233);
+    				detach_dev(div118);
+    				detach_dev(t234);
+    				detach_dev(p0);
+    				detach_dev(t240);
+    				detach_dev(p1);
+    				detach_dev(t267);
+    				detach_dev(p2);
+    				detach_dev(t278);
+    				detach_dev(p3);
+    				detach_dev(t280);
+    				detach_dev(div119);
+    				detach_dev(t395);
+    				detach_dev(p4);
+    				detach_dev(t401);
+    				detach_dev(p5);
+    				detach_dev(t411);
+    				detach_dev(p6);
+    				detach_dev(t422);
+    				detach_dev(div122);
+    			}
+
     			run_all(dispose);
     		}
     	};
-
-    	dispatch_dev("SvelteRegisterBlock", {
-    		block,
-    		id: create_fragment$3.name,
-    		type: "component",
-    		source: "",
-    		ctx
-    	});
-
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$3.name, type: "component", source: "", ctx });
     	return block;
     }
 
     const legendheight = 67;
 
-    function range$1(n) {
-    	return Array(n).fill().map((_, i) => i);
-    }
+    let width$1  = 750;
+
+    let height$1 = 400;
+
+    var Tinc_s = "\\color{#CCC}{T^{-1}_{\\text{inc}}} ";
+
+    var Tinf_s = "\\color{#CCC}{T^{-1}_{\\text{inf}}}";
+
+    var Rt_s   = "\\color{#CCC}{\\frac{\\mathcal{R}_{t}}{T_{\\text{inf}}}} ";
 
     function formatNumber$1(num) {
-    	return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, "$1,");
+      return num.toString().replace(/(\d)(?=(\d{3})+(?!\d))/g, '$1,')
     }
 
     function math_inline(str) {
-    	return katex$1.renderToString(str, {
-    		throwOnError: false,
-    		displayMode: false,
-    		colorIsTextColor: true
-    	});
-    }
-
-    function math_display(str) {
-    	return katex$1.renderToString(str, {
-    		throwOnError: false,
-    		displayMode: true,
-    		colorIsTextColor: true
-    	});
+      return katex$1.renderToString(str, {
+      throwOnError: false,
+      displayMode: false,
+      colorIsTextColor: true
+      });
     }
 
     function instance$3($$self, $$props, $$invalidate) {
-    	var sum = function (arr, bools) {
-    		var x = 0;
+    	
 
-    		for (var i = 0; i < arr.length; i++) {
-    			x = x + arr[i] * (bools[i] ? 1 : 0);
-    		}
+      var sum = function(arr, bools){
+        var x = 0;
+        for (var i = 0; i < arr.length; i++) {
+          x = x + arr[i]*(bools[i] ? 1 : 0);
+        }
+        return x
+      };
 
-    		return x;
-    	};
+      var Integrators = {
+        Euler    : [[1]],
+        Midpoint : [[.5,.5],[0, 1]],
+        Heun     : [[1, 1],[.5,.5]],
+        Ralston  : [[2/3,2/3],[.25,.75]],
+        K3       : [[.5,.5],[1,-1,2],[1/6,2/3,1/6]],
+        SSP33    : [[1,1],[.5,.25,.25],[1/6,1/6,2/3]],
+        SSP43    : [[.5,.5],[1,.5,.5],[.5,1/6,1/6,1/6],[1/6,1/6,1/6,1/2]],
+        RK4      : [[.5,.5],[.5,0,.5],[1,0,0,1],[1/6,1/3,1/3,1/6]],
+        RK38     : [[1/3,1/3],[2/3,-1/3,1],[1,1,-1,1],[1/8,3/8,3/8,1/8]]
+      };
 
-    	var Integrators = {
-    		Euler: [[1]],
-    		Midpoint: [[0.5, 0.5], [0, 1]],
-    		Heun: [[1, 1], [0.5, 0.5]],
-    		Ralston: [[2 / 3, 2 / 3], [0.25, 0.75]],
-    		K3: [[0.5, 0.5], [1, -1, 2], [1 / 6, 2 / 3, 1 / 6]],
-    		SSP33: [[1, 1], [0.5, 0.25, 0.25], [1 / 6, 1 / 6, 2 / 3]],
-    		SSP43: [
-    			[0.5, 0.5],
-    			[1, 0.5, 0.5],
-    			[0.5, 1 / 6, 1 / 6, 1 / 6],
-    			[1 / 6, 1 / 6, 1 / 6, 1 / 2]
-    		],
-    		RK4: [[0.5, 0.5], [0.5, 0, 0.5], [1, 0, 0, 1], [1 / 6, 1 / 3, 1 / 3, 1 / 6]],
-    		RK38: [
-    			[1 / 3, 1 / 3],
-    			[2 / 3, -1 / 3, 1],
-    			[1, 1, -1, 1],
-    			[1 / 8, 3 / 8, 3 / 8, 1 / 8]
-    		]
-    	};
+      // f is a func of time t and state y
+      // y is the initial state, t is the time, h is the timestep
+      // updated y is returned.
+      var integrate=(m,f,y,t,h)=>{
+        for (var k=[],ki=0; ki<m.length; ki++) {
+          var _y=y.slice(), dt=ki?((m[ki-1][0])*h):0;
+          for (var l=0; l<_y.length; l++) for (var j=1; j<=ki; j++) _y[l]=_y[l]+h*(m[ki-1][j])*(k[ki-1][l]);
+          k[ki]=f(t+dt,_y,dt); 
+        }
+        for (var r=y.slice(),l=0; l<_y.length; l++) for (var j=0; j<k.length; j++) r[l]=r[l]+h*(k[j][l])*(m[ki-1][j]);
+        return r;
+      };
 
-    	// f is a func of time t and state y
-    	// y is the initial state, t is the time, h is the timestep
-    	// updated y is returned.
-    	var integrate = (m, f, y, t, h) => {
-    		for (var k = [], ki = 0; ki < m.length; ki++) {
-    			var _y = y.slice(), dt = ki ? m[ki - 1][0] * h : 0;
-    			for (var l = 0; l < _y.length; l++) for (var j = 1; j <= ki; j++) _y[l] = _y[l] + h * m[ki - 1][j] * k[ki - 1][l];
-    			k[ki] = f(t + dt, _y, dt);
-    		}
+      function get_solution(dt, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, D_death, P_SEVERE, CFR, InterventionTime, InterventionAmt, duration) {
 
-    		for (var r = y.slice(), l = 0; l < _y.length; l++) for (var j = 0; j < k.length; j++) r[l] = r[l] + h * k[j][l] * m[ki - 1][j];
-    		return r;
-    	};
+        var interpolation_steps = 40;
+        var steps = 110*interpolation_steps;
+        var dt = dt/interpolation_steps;
+        var sample_step = interpolation_steps;
 
-    	function get_solution(
-    		dt,
-    	N,
-    	I0,
-    	R0,
-    	D_incbation,
-    	D_infectious,
-    	D_recovery_mild,
-    	D_hospital_lag,
-    	D_recovery_severe,
-    	D_death,
-    	P_SEVERE,
-    	CFR,
-    	InterventionTime,
-    	InterventionAmt,
-    	duration
-    	) {
-    		var interpolation_steps = 40;
-    		var steps = 110 * interpolation_steps;
-    		var dt = dt / interpolation_steps;
-    		var sample_step = interpolation_steps;
-    		var method = Integrators["RK4"];
+        var method = Integrators["RK4"];
+        function f(t, x){
 
-    		function f(t, x) {
-    			// SEIR ODE
-    			if (t > InterventionTime && t < InterventionTime + duration) {
-    				var beta = InterventionAmt * R0 / D_infectious;
-    			} else if (t > InterventionTime + duration) {
-    				var beta = 0.5 * R0 / D_infectious;
-    			} else {
-    				var beta = R0 / D_infectious;
-    			}
+          // SEIR ODE
+          if (t > InterventionTime && t < InterventionTime + duration){
+            var beta = (InterventionAmt)*R0/(D_infectious);
+          } else if (t > InterventionTime + duration) {
+            var beta = 0.5*R0/(D_infectious);        
+          } else {
+            var beta = R0/(D_infectious);
+          }
+          var a     = 1/D_incbation;
+          var gamma = 1/D_infectious;
+          
+          var S        = x[0]; // Susectable
+          var E        = x[1]; // Exposed
+          var I        = x[2]; // Infectious 
+          var Mild     = x[3]; // Recovering (Mild)     
+          var Severe   = x[4]; // Recovering (Severe at home)
+          var Severe_H = x[5]; // Recovering (Severe in hospital)
+          var Fatal    = x[6]; // Recovering (Fatal)
+          var R_Mild   = x[7]; // Recovered
+          var R_Severe = x[8]; // Recovered
+          var R_Fatal  = x[9]; // Dead
 
-    			var a = 1 / D_incbation;
-    			var gamma = 1 / D_infectious;
-    			var S = x[0]; // Susectable
-    			var E = x[1]; // Exposed
-    			var I = x[2]; // Infectious 
-    			var Mild = x[3]; // Recovering (Mild)     
-    			var Severe = x[4]; // Recovering (Severe at home)
-    			var Severe_H = x[5]; // Recovering (Severe in hospital)
-    			var Fatal = x[6]; // Recovering (Fatal)
-    			var R_Mild = x[7]; // Recovered
-    			var R_Severe = x[8]; // Recovered
-    			var R_Fatal = x[9]; // Dead
-    			var p_severe = P_SEVERE;
-    			var p_fatal = CFR;
-    			var p_mild = 1 - P_SEVERE - CFR;
-    			var dS = -beta * I * S;
-    			var dE = beta * I * S - a * E;
-    			var dI = a * E - gamma * I;
-    			var dMild = p_mild * gamma * I - 1 / D_recovery_mild * Mild;
-    			var dSevere = p_severe * gamma * I - 1 / D_hospital_lag * Severe;
-    			var dSevere_H = 1 / D_hospital_lag * Severe - 1 / D_recovery_severe * Severe_H;
-    			var dFatal = p_fatal * gamma * I - 1 / D_death * Fatal;
-    			var dR_Mild = 1 / D_recovery_mild * Mild;
-    			var dR_Severe = 1 / D_recovery_severe * Severe_H;
-    			var dR_Fatal = 1 / D_death * Fatal;
+          var p_severe = P_SEVERE;
+          var p_fatal  = CFR;
+          var p_mild   = 1 - P_SEVERE - CFR;
 
-    			//      0   1   2   3      4        5          6       7        8          9
-    			return [
-    				dS,
-    				dE,
-    				dI,
-    				dMild,
-    				dSevere,
-    				dSevere_H,
-    				dFatal,
-    				dR_Mild,
-    				dR_Severe,
-    				dR_Fatal
-    			];
-    		}
+          var dS        = -beta*I*S;
+          var dE        =  beta*I*S - a*E;
+          var dI        =  a*E - gamma*I;
+          var dMild     =  p_mild*gamma*I   - (1/D_recovery_mild)*Mild;
+          var dSevere   =  p_severe*gamma*I - (1/D_hospital_lag)*Severe;
+          var dSevere_H =  (1/D_hospital_lag)*Severe - (1/D_recovery_severe)*Severe_H;
+          var dFatal    =  p_fatal*gamma*I  - (1/D_death)*Fatal;
+          var dR_Mild   =  (1/D_recovery_mild)*Mild;
+          var dR_Severe =  (1/D_recovery_severe)*Severe_H;
+          var dR_Fatal  =  (1/D_death)*Fatal;
 
-    		var v = [1, 0, I0 / (N - I0), 0, 0, 0, 0, 0, 0, 0];
-    		var t = 0;
-    		var P = [];
-    		var TI = [];
-    		var Iters = [];
+          //      0   1   2   3      4        5          6       7        8          9
+          return [dS, dE, dI, dMild, dSevere, dSevere_H, dFatal, dR_Mild, dR_Severe, dR_Fatal]
+        }
 
-    		while (steps--) {
-    			if ((steps + 1) % sample_step == 0) {
-    				//    Dead   Hospital          Recovered        Infected   Exposed
-    				P.push([N * v[9], N * (v[5] + v[6]), N * (v[7] + v[8]), N * v[2], N * v[1]]);
+        var v = [1, 0, I0/(N-I0), 0, 0, 0, 0, 0, 0, 0];
+        var t = 0;
 
-    				Iters.push(v);
-    				TI.push(N * (1 - v[0]));
-    			} // console.log((v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7] + v[8] + v[9]))
-    			// console.log(v[0] , v[1] , v[2] , v[3] , v[4] , v[5] , v[6] , v[7] , v[8] , v[9])
+        var P  = [];
+        var TI = [];
+        var Iters = [];
+        while (steps--) { 
+          if ((steps+1) % (sample_step) == 0) {
+                //    Dead   Hospital          Recovered        Infected   Exposed
+            P.push([ N*v[9], N*(v[5]+v[6]),  N*(v[7] + v[8]), N*v[2],    N*v[1] ]);
+            Iters.push(v);
+            TI.push(N*(1-v[0]));
+            // console.log((v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7] + v[8] + v[9]))
+            // console.log(v[0] , v[1] , v[2] , v[3] , v[4] , v[5] , v[6] , v[7] , v[8] , v[9])
+          }
+          v =integrate(method,f,v,t,dt); 
+          t+=dt;
+        }
+        return {"P": P, 
+                "deaths": N*v[6], 
+                "total": 1-v[0],
+                "total_infected": TI,
+                "Iters":Iters,
+                "dIters": f}
+      }
 
-    			v = integrate(method, f, v, t, dt);
-    			t += dt;
-    		}
+      function max(P, checked) {
+        return P.reduce((max, b) => Math.max(max, sum(b, checked) ), sum(P[0], checked) )
+      }
 
-    		return {
-    			P,
-    			"deaths": N * v[6],
-    			"total": 1 - v[0],
-    			"total_infected": TI,
-    			Iters,
-    			"dIters": f
-    		};
-    	}
+      var colors = [ "#386cb0", "#8da0cb", "#4daf4a", "#f0027f", "#fdc086"];
 
-    	function max(P, checked) {
-    		return P.reduce((max, b) => Math.max(max, sum(b, checked)), sum(P[0], checked));
-    	}
+      var Plock = 1;
 
-    	var colors = ["#386cb0", "#8da0cb", "#4daf4a", "#f0027f", "#fdc086"];
-    	var Plock = 1;
+      var drag_y = function (){
+        var dragstarty = 0;
+        var Pmaxstart = 0;
 
-    	var drag_y = function () {
-    		var dragstarty = 0;
-    		var Pmaxstart = 0;
+        var dragstarted = function (d) {
+          dragstarty = event.y;  
+          Pmaxstart  = Pmax;
+        };
 
-    		var dragstarted = function (d) {
-    			dragstarty = event.y;
-    			Pmaxstart = Pmax;
-    		};
+        var dragged = function (d) {
+          $$invalidate('Pmax', Pmax = Math.max( (Pmaxstart*(1 + (event.y - dragstarty)/500)), 10));
+        };
 
-    		var dragged = function (d) {
-    			$$invalidate(24, Pmax = Math.max(Pmaxstart * (1 + (event.y - dragstarty) / 500), 10));
-    		};
+        return drag().on("drag", dragged).on("start", dragstarted)
+      };
 
-    		return drag().on("drag", dragged).on("start", dragstarted);
-    	};
+      var drag_x = function (){
+        var dragstartx = 0;
+        var dtstart = 0;
+        var dragstarted = function (d) {
+          dragstartx = event.x;
+          dtstart  = dt;
+          $$invalidate('Plock', Plock = Pmax);
+          $$invalidate('lock', lock = true);
+        };
+        var dragged = function (d) {
+          $$invalidate('dt', dt = dtstart - 0.0015*(event.x - dragstartx));
+        };
+        var dragend = function (d) {
+          $$invalidate('lock', lock = false);
+        };
+        return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend)
+      };
 
-    	var drag_x = function () {
-    		var dragstartx = 0;
-    		var dtstart = 0;
+      var drag_intervention = function (){
+        var dragstarty = 0;
+        var InterventionTimeStart = 0;
 
-    		var dragstarted = function (d) {
-    			dragstartx = event.x;
-    			dtstart = dt;
-    			$$invalidate(0, Plock = Pmax);
-    			$$invalidate(26, lock = true);
-    		};
+        var dragstarted = function (d) {
+          dragstarty = event.x;  
+          InterventionTimeStart = InterventionTime;
+          $$invalidate('Plock', Plock = Pmax);
+          $$invalidate('lock', lock = true);
+        };
 
-    		var dragged = function (d) {
-    			$$invalidate(43, dt = dtstart - 0.0015 * (event.x - dragstartx));
-    		};
+        var dragged = function (d) {
+          // InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
+          // console.log(event.x)
+          $$invalidate('InterventionTime', InterventionTime = Math.min(tmax-1, Math.max(0, InterventionTimeStart + xScaleTimeInv(event.x - dragstarty))));
+        };
 
-    		var dragend = function (d) {
-    			$$invalidate(26, lock = false);
-    		};
+        var dragend = function (d) {
+          $$invalidate('lock', lock = false);
+        };
 
-    		return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend);
-    	};
+        return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend)
+      };
 
-    	var drag_intervention = function () {
-    		var dragstarty = 0;
-    		var InterventionTimeStart = 0;
 
-    		var dragstarted = function (d) {
-    			dragstarty = event.x;
-    			InterventionTimeStart = InterventionTime;
-    			$$invalidate(0, Plock = Pmax);
-    			$$invalidate(26, lock = true);
-    		};
+      var drag_intervention_end = function (){
+        var dragstarty = 0;
+        var durationStart = 0;
 
-    		var dragged = function (d) {
-    			// InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
-    			// console.log(event.x)
-    			$$invalidate(12, InterventionTime = Math.min(tmax - 1, Math.max(0, InterventionTimeStart + xScaleTimeInv(event.x - dragstarty))));
-    		};
+        var dragstarted = function (d) {
+          dragstarty = event.x;  
+          durationStart = duration;
+          $$invalidate('Plock', Plock = Pmax);
+          $$invalidate('lock', lock = true);
+        };
 
-    		var dragend = function (d) {
-    			$$invalidate(26, lock = false);
-    		};
+        var dragged = function (d) {
+          // InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
+          // console.log(event.x)
+          $$invalidate('duration', duration = Math.min(tmax-1, Math.max(0, durationStart + xScaleTimeInv(event.x - dragstarty))));
+        };
 
-    		return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend);
-    	};
+        var dragend = function (d) {
+          $$invalidate('lock', lock = false);
+        };
 
-    	var drag_intervention_end = function () {
-    		var dragstarty = 0;
-    		var durationStart = 0;
+        return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend)
+      };
+      onMount(async () => {
+        var drag_callback_y = drag_y();
+        drag_callback_y(selectAll("#yAxisDrag"));
+        var drag_callback_x = drag_x();
+        drag_callback_x(selectAll("#xAxisDrag"));
+        var drag_callback_intervention = drag_intervention();
+        // drag_callback_intervention(selectAll("#interventionDrag"))
+        drag_callback_intervention(selectAll("#dottedline"));
+        // var drag_callback_intervention_end = drag_intervention_end()
+        // drag_callback_intervention_end(selectAll("#dottedline2"))
 
-    		var dragstarted = function (d) {
-    			dragstarty = event.x;
-    			durationStart = duration;
-    			$$invalidate(0, Plock = Pmax);
-    			$$invalidate(26, lock = true);
-    		};
+        if (typeof window !== 'undefined') {
+          parsed = queryString.parse(window.location.search);
+          if (!(parsed.logN === undefined)) {$$invalidate('logN', logN = parsed.logN);}
+          if (!(parsed.I0 === undefined)) {$$invalidate('I0', I0 = parseFloat(parsed.I0));}
+          if (!(parsed.R0 === undefined)) {$$invalidate('R0', R0 = parseFloat(parsed.R0));}
+          if (!(parsed.D_incbation === undefined)) {$$invalidate('D_incbation', D_incbation = parseFloat(parsed.D_incbation));}
+          if (!(parsed.D_infectious === undefined)) {$$invalidate('D_infectious', D_infectious = parseFloat(parsed.D_infectious));}
+          if (!(parsed.D_recovery_mild === undefined)) {$$invalidate('D_recovery_mild', D_recovery_mild = parseFloat(parsed.D_recovery_mild));}
+          if (!(parsed.D_recovery_severe === undefined)) {$$invalidate('D_recovery_severe', D_recovery_severe = parseFloat(parsed.D_recovery_severe));}
+          if (!(parsed.CFR === undefined)) {$$invalidate('CFR', CFR = parseFloat(parsed.CFR));}
+          if (!(parsed.InterventionTime === undefined)) {$$invalidate('InterventionTime', InterventionTime = parseFloat(parsed.InterventionTime));}
+          if (!(parsed.InterventionAmt === undefined)) {$$invalidate('InterventionAmt', InterventionAmt = parseFloat(parsed.InterventionAmt));}
+          if (!(parsed.D_hospital_lag === undefined)) {$$invalidate('D_hospital_lag', D_hospital_lag = parseFloat(parsed.D_hospital_lag));}
+          if (!(parsed.P_SEVERE === undefined)) {$$invalidate('P_SEVERE', P_SEVERE = parseFloat(parsed.P_SEVERE));}
+        }
+      });
 
-    		var dragged = function (d) {
-    			// InterventionTime = Math.max( (*(1 + (event.x - dragstarty)/500)), 10)
-    			// console.log(event.x)
-    			$$invalidate(44, duration = Math.min(tmax - 1, Math.max(0, durationStart + xScaleTimeInv(event.x - dragstarty))));
-    		};
+      function lock_yaxis(){
+        $$invalidate('Plock', Plock = Pmax);
+        $$invalidate('lock', lock  = true);
+      }
 
-    		var dragend = function (d) {
-    			$$invalidate(26, lock = false);
-    		};
+      function unlock_yaxis(){
+        $$invalidate('lock', lock = false);
+      }
 
-    		return drag().on("drag", dragged).on("start", dragstarted).on("end", dragend);
-    	};
+      const padding = { top: 20, right: 0, bottom: 20, left: 25 };
 
-    	onMount(async () => {
-    		var drag_callback_y = drag_y();
-    		drag_callback_y(selectAll("#yAxisDrag"));
-    		var drag_callback_x = drag_x();
-    		drag_callback_x(selectAll("#xAxisDrag"));
-    		var drag_callback_intervention = drag_intervention();
+      window.addEventListener('mouseup', unlock_yaxis);
 
-    		// drag_callback_intervention(selectAll("#interventionDrag"))
-    		drag_callback_intervention(selectAll("#dottedline"));
+      function get_milestones(P){
 
-    		// var drag_callback_intervention_end = drag_intervention_end()
-    		// drag_callback_intervention_end(selectAll("#dottedline2"))
-    		if (typeof window !== "undefined") {
-    			parsed = queryString.parse(window.location.search);
+        function argmax(x, index) {
+          return x.map((x, i) => [x[index], i]).reduce((r, a) => (a[0] > r[0] ? a : r))[1];
+        }
 
-    			if (!(parsed.logN === undefined)) {
-    				$$invalidate(2, logN = parsed.logN);
-    			}
+         //    Dead   Hospital          Recovered        Infected   Exposed
+        var milestones = [];
+        for (var i = 0; i < P.length; i++) {
+          if (P[i][0] >= 0.5) {
+            milestones.push([i*dt, "Primeira Morte"]);
+            break
+          }
+        }
 
-    			if (!(parsed.I0 === undefined)) {
-    				$$invalidate(4, I0 = parseFloat(parsed.I0));
-    			}
+        var i = argmax(P, 1);
+        milestones.push([i*dt, "Pico: " + format(",")(Math.round(P[i][1])) + " hospitalizações"]);
 
-    			if (!(parsed.R0 === undefined)) {
-    				$$invalidate(5, R0 = parseFloat(parsed.R0));
-    			}
-
-    			if (!(parsed.D_incbation === undefined)) {
-    				$$invalidate(6, D_incbation = parseFloat(parsed.D_incbation));
-    			}
-
-    			if (!(parsed.D_infectious === undefined)) {
-    				$$invalidate(7, D_infectious = parseFloat(parsed.D_infectious));
-    			}
-
-    			if (!(parsed.D_recovery_mild === undefined)) {
-    				$$invalidate(8, D_recovery_mild = parseFloat(parsed.D_recovery_mild));
-    			}
-
-    			if (!(parsed.D_recovery_severe === undefined)) {
-    				$$invalidate(9, D_recovery_severe = parseFloat(parsed.D_recovery_severe));
-    			}
-
-    			if (!(parsed.CFR === undefined)) {
-    				$$invalidate(11, CFR = parseFloat(parsed.CFR));
-    			}
-
-    			if (!(parsed.InterventionTime === undefined)) {
-    				$$invalidate(12, InterventionTime = parseFloat(parsed.InterventionTime));
-    			}
-
-    			if (!(parsed.InterventionAmt === undefined)) {
-    				$$invalidate(13, InterventionAmt = parseFloat(parsed.InterventionAmt));
-    			}
-
-    			if (!(parsed.D_hospital_lag === undefined)) {
-    				$$invalidate(10, D_hospital_lag = parseFloat(parsed.D_hospital_lag));
-    			}
-
-    			if (!(parsed.P_SEVERE === undefined)) {
-    				$$invalidate(15, P_SEVERE = parseFloat(parsed.P_SEVERE));
-    			}
-    		}
-    	});
-
-    	function lock_yaxis() {
-    		$$invalidate(0, Plock = Pmax);
-    		$$invalidate(26, lock = true);
-    	}
-
-    	function unlock_yaxis() {
-    		$$invalidate(26, lock = false);
-    	}
-
-    	const padding = { top: 20, right: 0, bottom: 20, left: 25 };
-    	let width = 750;
-    	let height = 400;
-    	window.addEventListener("mouseup", unlock_yaxis);
-    	var Tinc_s = "\\color{#CCC}{T^{-1}_{\\text{inc}}} ";
-    	var Tinf_s = "\\color{#CCC}{T^{-1}_{\\text{inf}}}";
-    	var Rt_s = "\\color{#CCC}{\\frac{\\mathcal{R}_{t}}{T_{\\text{inf}}}} ";
-
-    	function get_milestones(P) {
-    		function argmax(x, index) {
-    			return x.map((x, i) => [x[index], i]).reduce((r, a) => a[0] > r[0] ? a : r)[1];
-    		}
-
-    		//    Dead   Hospital          Recovered        Infected   Exposed
-    		var milestones = [];
-
-    		for (var i = 0; i < P.length; i++) {
-    			if (P[i][0] >= 0.5) {
-    				milestones.push([i * dt, "Primeira Morte"]);
-    				break;
-    			}
-    		}
-
-    		var i = argmax(P, 1);
-    		milestones.push([i * dt, "Pico: " + format(",")(Math.round(P[i][1])) + " hospitalizações"]);
-    		return milestones;
-    	}
-
-    	const writable_props = [];
-
-    	Object.keys($$props).forEach(key => {
-    		if (!~writable_props.indexOf(key) && key.slice(0, 2) !== "$$") console.warn(`<App> was created with unknown prop '${key}'`);
-    	});
-
-    	let { $$slots = {}, $$scope } = $$props;
-    	validate_slots("App", $$slots, []);
+        return milestones
+      }
 
     	function checkbox1_checked_binding(value) {
     		checked[4] = value;
-    		$$invalidate(25, checked);
+    		$$invalidate('checked', checked);
     	}
 
-    	function checkbox2_checked_binding(value) {
-    		checked[3] = value;
-    		$$invalidate(25, checked);
+    	function checkbox2_checked_binding(value_1) {
+    		checked[3] = value_1;
+    		$$invalidate('checked', checked);
     	}
 
-    	const func = s => {
-    		$$invalidate(25, checked[1] = s, checked);
-    		$$invalidate(25, checked[0] = s, checked);
-    		$$invalidate(25, checked[2] = s, checked);
-    	};
+    	const func = (s) => {$$invalidate('checked', checked[1] = s, checked); $$invalidate('checked', checked[0] = s, checked); $$invalidate('checked', checked[2] = s, checked);};
 
-    	function checkbox4_checked_binding(value) {
-    		checked[2] = value;
-    		$$invalidate(25, checked);
+    	function checkbox4_checked_binding(value_2) {
+    		checked[2] = value_2;
+    		$$invalidate('checked', checked);
     	}
 
-    	function checkbox5_checked_binding(value) {
-    		checked[1] = value;
-    		$$invalidate(25, checked);
+    	function checkbox5_checked_binding(value_3) {
+    		checked[1] = value_3;
+    		$$invalidate('checked', checked);
     	}
 
-    	function checkbox6_checked_binding(value) {
-    		checked[0] = value;
-    		$$invalidate(25, checked);
+    	function checkbox6_checked_binding(value_4) {
+    		checked[0] = value_4;
+    		$$invalidate('checked', checked);
     	}
 
-    	function chart_checked_binding(value) {
-    		checked = value;
-    		$$invalidate(25, checked);
+    	function chart_checked_binding(value_5) {
+    		checked = value_5;
+    		$$invalidate('checked', checked);
     	}
 
-    	function chart_active_binding(value) {
-    		active = value;
-    		$$invalidate(29, active);
+    	function chart_active_binding(value_6) {
+    		active = value_6;
+    		$$invalidate('active', active);
     	}
 
     	function input0_change_input_handler() {
     		InterventionAmt = to_number(this.value);
-    		$$invalidate(13, InterventionAmt);
+    		$$invalidate('InterventionAmt', InterventionAmt);
     	}
 
-    	function checkbox7_checked_binding(value) {
-    		log = value;
-    		$$invalidate(35, log);
+    	function checkbox7_checked_binding(value_7) {
+    		log = value_7;
+    		$$invalidate('log', log);
     	}
 
     	function input1_change_input_handler() {
     		logN = to_number(this.value);
-    		$$invalidate(2, logN);
+    		$$invalidate('logN', logN);
     	}
 
     	function input2_change_input_handler() {
     		I0 = to_number(this.value);
-    		$$invalidate(4, I0);
+    		$$invalidate('I0', I0);
     	}
 
     	function input3_change_input_handler() {
     		R0 = to_number(this.value);
-    		$$invalidate(5, R0);
+    		$$invalidate('R0', R0);
     	}
 
     	function input4_change_input_handler() {
     		D_incbation = to_number(this.value);
-    		$$invalidate(6, D_incbation);
+    		$$invalidate('D_incbation', D_incbation);
     	}
 
     	function input5_change_input_handler() {
     		D_infectious = to_number(this.value);
-    		$$invalidate(7, D_infectious);
+    		$$invalidate('D_infectious', D_infectious);
     	}
 
     	function input6_change_input_handler() {
     		CFR = to_number(this.value);
-    		$$invalidate(11, CFR);
+    		$$invalidate('CFR', CFR);
     	}
 
     	function input7_change_input_handler() {
     		Time_to_death = to_number(this.value);
-    		$$invalidate(1, Time_to_death);
+    		$$invalidate('Time_to_death', Time_to_death);
     	}
 
     	function input8_change_input_handler() {
     		D_recovery_severe = to_number(this.value);
-    		$$invalidate(9, D_recovery_severe);
+    		$$invalidate('D_recovery_severe', D_recovery_severe);
     	}
 
     	function input9_change_input_handler() {
     		D_recovery_mild = to_number(this.value);
-    		$$invalidate(8, D_recovery_mild);
+    		$$invalidate('D_recovery_mild', D_recovery_mild);
     	}
 
     	function input10_change_input_handler() {
     		P_SEVERE = to_number(this.value);
-    		$$invalidate(15, P_SEVERE);
+    		$$invalidate('P_SEVERE', P_SEVERE);
     	}
 
     	function input11_change_input_handler() {
     		D_hospital_lag = to_number(this.value);
-    		$$invalidate(10, D_hospital_lag);
+    		$$invalidate('D_hospital_lag', D_hospital_lag);
     	}
 
     	function input12_input_handler() {
     		p_num_ind = this.value;
-    		$$invalidate(32, p_num_ind);
+    		$$invalidate('p_num_ind', p_num_ind);
     	}
 
-    	$$self.$capture_state = () => ({
-    		scaleLinear: linear$1,
-    		Chart,
-    		onMount,
-    		selectAll,
-    		drag,
-    		queryString,
-    		Checkbox,
-    		Arrow,
-    		format,
-    		event,
-    		katex: katex$1,
-    		legendheight,
-    		range: range$1,
-    		formatNumber: formatNumber$1,
-    		sum,
-    		Integrators,
-    		integrate,
-    		get_solution,
-    		max,
-    		colors,
-    		Plock,
-    		drag_y,
-    		drag_x,
-    		drag_intervention,
-    		drag_intervention_end,
-    		lock_yaxis,
-    		unlock_yaxis,
-    		padding,
-    		width,
-    		height,
-    		Tinc_s,
-    		Tinf_s,
-    		Rt_s,
-    		math_inline,
-    		math_display,
-    		get_milestones,
-    		Time_to_death,
-    		logN,
-    		N,
-    		I0,
-    		R0,
-    		D_incbation,
-    		D_infectious,
-    		D_recovery_mild,
-    		D_recovery_severe,
-    		D_hospital_lag,
-    		D_death,
-    		CFR,
-    		InterventionTime,
-    		InterventionAmt,
-    		Time,
-    		Xmax,
-    		dt,
-    		P_SEVERE,
-    		duration,
-    		state,
-    		Sol,
-    		P,
-    		timestep,
-    		tmax,
-    		deaths,
-    		total,
-    		total_infected,
-    		Iters,
-    		dIters,
-    		Pmax,
-    		checked,
-    		lock,
-    		xScaleTimeInv,
-    		parsed,
-    		xScaleTime,
-    		indexToTime,
-    		active,
-    		active_,
-    		ode_eqn,
-    		p_num_ind,
-    		get_d,
-    		milestones,
-    		log
-    	});
+    	$$self.$capture_state = () => {
+    		return {};
+    	};
 
     	$$self.$inject_state = $$props => {
-    		if ("sum" in $$props) sum = $$props.sum;
-    		if ("Integrators" in $$props) Integrators = $$props.Integrators;
-    		if ("integrate" in $$props) integrate = $$props.integrate;
-    		if ("colors" in $$props) $$invalidate(36, colors = $$props.colors);
-    		if ("Plock" in $$props) $$invalidate(0, Plock = $$props.Plock);
-    		if ("drag_y" in $$props) drag_y = $$props.drag_y;
-    		if ("drag_x" in $$props) drag_x = $$props.drag_x;
-    		if ("drag_intervention" in $$props) drag_intervention = $$props.drag_intervention;
-    		if ("drag_intervention_end" in $$props) drag_intervention_end = $$props.drag_intervention_end;
-    		if ("width" in $$props) $$invalidate(39, width = $$props.width);
-    		if ("height" in $$props) $$invalidate(40, height = $$props.height);
-    		if ("Tinc_s" in $$props) $$invalidate(59, Tinc_s = $$props.Tinc_s);
-    		if ("Tinf_s" in $$props) $$invalidate(60, Tinf_s = $$props.Tinf_s);
-    		if ("Rt_s" in $$props) $$invalidate(61, Rt_s = $$props.Rt_s);
-    		if ("Time_to_death" in $$props) $$invalidate(1, Time_to_death = $$props.Time_to_death);
-    		if ("logN" in $$props) $$invalidate(2, logN = $$props.logN);
-    		if ("N" in $$props) $$invalidate(3, N = $$props.N);
-    		if ("I0" in $$props) $$invalidate(4, I0 = $$props.I0);
-    		if ("R0" in $$props) $$invalidate(5, R0 = $$props.R0);
-    		if ("D_incbation" in $$props) $$invalidate(6, D_incbation = $$props.D_incbation);
-    		if ("D_infectious" in $$props) $$invalidate(7, D_infectious = $$props.D_infectious);
-    		if ("D_recovery_mild" in $$props) $$invalidate(8, D_recovery_mild = $$props.D_recovery_mild);
-    		if ("D_recovery_severe" in $$props) $$invalidate(9, D_recovery_severe = $$props.D_recovery_severe);
-    		if ("D_hospital_lag" in $$props) $$invalidate(10, D_hospital_lag = $$props.D_hospital_lag);
-    		if ("D_death" in $$props) $$invalidate(41, D_death = $$props.D_death);
-    		if ("CFR" in $$props) $$invalidate(11, CFR = $$props.CFR);
-    		if ("InterventionTime" in $$props) $$invalidate(12, InterventionTime = $$props.InterventionTime);
-    		if ("InterventionAmt" in $$props) $$invalidate(13, InterventionAmt = $$props.InterventionAmt);
-    		if ("Time" in $$props) Time = $$props.Time;
-    		if ("Xmax" in $$props) $$invalidate(14, Xmax = $$props.Xmax);
-    		if ("dt" in $$props) $$invalidate(43, dt = $$props.dt);
-    		if ("P_SEVERE" in $$props) $$invalidate(15, P_SEVERE = $$props.P_SEVERE);
-    		if ("duration" in $$props) $$invalidate(44, duration = $$props.duration);
-    		if ("state" in $$props) $$invalidate(16, state = $$props.state);
-    		if ("Sol" in $$props) $$invalidate(45, Sol = $$props.Sol);
-    		if ("P" in $$props) $$invalidate(17, P = $$props.P);
-    		if ("timestep" in $$props) $$invalidate(18, timestep = $$props.timestep);
-    		if ("tmax" in $$props) $$invalidate(19, tmax = $$props.tmax);
-    		if ("deaths" in $$props) $$invalidate(20, deaths = $$props.deaths);
-    		if ("total" in $$props) $$invalidate(21, total = $$props.total);
-    		if ("total_infected" in $$props) $$invalidate(22, total_infected = $$props.total_infected);
-    		if ("Iters" in $$props) $$invalidate(23, Iters = $$props.Iters);
-    		if ("dIters" in $$props) $$invalidate(46, dIters = $$props.dIters);
-    		if ("Pmax" in $$props) $$invalidate(24, Pmax = $$props.Pmax);
-    		if ("checked" in $$props) $$invalidate(25, checked = $$props.checked);
-    		if ("lock" in $$props) $$invalidate(26, lock = $$props.lock);
-    		if ("xScaleTimeInv" in $$props) xScaleTimeInv = $$props.xScaleTimeInv;
-    		if ("parsed" in $$props) parsed = $$props.parsed;
-    		if ("xScaleTime" in $$props) $$invalidate(27, xScaleTime = $$props.xScaleTime);
-    		if ("indexToTime" in $$props) $$invalidate(28, indexToTime = $$props.indexToTime);
-    		if ("active" in $$props) $$invalidate(29, active = $$props.active);
-    		if ("active_" in $$props) $$invalidate(30, active_ = $$props.active_);
-    		if ("ode_eqn" in $$props) $$invalidate(31, ode_eqn = $$props.ode_eqn);
-    		if ("p_num_ind" in $$props) $$invalidate(32, p_num_ind = $$props.p_num_ind);
-    		if ("get_d" in $$props) $$invalidate(33, get_d = $$props.get_d);
-    		if ("milestones" in $$props) $$invalidate(34, milestones = $$props.milestones);
-    		if ("log" in $$props) $$invalidate(35, log = $$props.log);
+    		if ('sum' in $$props) sum = $$props.sum;
+    		if ('Integrators' in $$props) Integrators = $$props.Integrators;
+    		if ('integrate' in $$props) integrate = $$props.integrate;
+    		if ('colors' in $$props) $$invalidate('colors', colors = $$props.colors);
+    		if ('Plock' in $$props) $$invalidate('Plock', Plock = $$props.Plock);
+    		if ('drag_y' in $$props) drag_y = $$props.drag_y;
+    		if ('drag_x' in $$props) drag_x = $$props.drag_x;
+    		if ('drag_intervention' in $$props) drag_intervention = $$props.drag_intervention;
+    		if ('drag_intervention_end' in $$props) drag_intervention_end = $$props.drag_intervention_end;
+    		if ('width' in $$props) $$invalidate('width', width$1 = $$props.width);
+    		if ('height' in $$props) $$invalidate('height', height$1 = $$props.height);
+    		if ('Tinc_s' in $$props) $$invalidate('Tinc_s', Tinc_s = $$props.Tinc_s);
+    		if ('Tinf_s' in $$props) $$invalidate('Tinf_s', Tinf_s = $$props.Tinf_s);
+    		if ('Rt_s' in $$props) $$invalidate('Rt_s', Rt_s = $$props.Rt_s);
+    		if ('Time_to_death' in $$props) $$invalidate('Time_to_death', Time_to_death = $$props.Time_to_death);
+    		if ('logN' in $$props) $$invalidate('logN', logN = $$props.logN);
+    		if ('N' in $$props) $$invalidate('N', N = $$props.N);
+    		if ('I0' in $$props) $$invalidate('I0', I0 = $$props.I0);
+    		if ('R0' in $$props) $$invalidate('R0', R0 = $$props.R0);
+    		if ('D_incbation' in $$props) $$invalidate('D_incbation', D_incbation = $$props.D_incbation);
+    		if ('D_infectious' in $$props) $$invalidate('D_infectious', D_infectious = $$props.D_infectious);
+    		if ('D_recovery_mild' in $$props) $$invalidate('D_recovery_mild', D_recovery_mild = $$props.D_recovery_mild);
+    		if ('D_recovery_severe' in $$props) $$invalidate('D_recovery_severe', D_recovery_severe = $$props.D_recovery_severe);
+    		if ('D_hospital_lag' in $$props) $$invalidate('D_hospital_lag', D_hospital_lag = $$props.D_hospital_lag);
+    		if ('D_death' in $$props) $$invalidate('D_death', D_death = $$props.D_death);
+    		if ('CFR' in $$props) $$invalidate('CFR', CFR = $$props.CFR);
+    		if ('InterventionTime' in $$props) $$invalidate('InterventionTime', InterventionTime = $$props.InterventionTime);
+    		if ('InterventionAmt' in $$props) $$invalidate('InterventionAmt', InterventionAmt = $$props.InterventionAmt);
+    		if ('Time' in $$props) Time = $$props.Time;
+    		if ('Xmax' in $$props) $$invalidate('Xmax', Xmax = $$props.Xmax);
+    		if ('dt' in $$props) $$invalidate('dt', dt = $$props.dt);
+    		if ('P_SEVERE' in $$props) $$invalidate('P_SEVERE', P_SEVERE = $$props.P_SEVERE);
+    		if ('duration' in $$props) $$invalidate('duration', duration = $$props.duration);
+    		if ('state' in $$props) $$invalidate('state', state = $$props.state);
+    		if ('Sol' in $$props) $$invalidate('Sol', Sol = $$props.Sol);
+    		if ('P' in $$props) $$invalidate('P', P = $$props.P);
+    		if ('timestep' in $$props) $$invalidate('timestep', timestep = $$props.timestep);
+    		if ('tmax' in $$props) $$invalidate('tmax', tmax = $$props.tmax);
+    		if ('deaths' in $$props) $$invalidate('deaths', deaths = $$props.deaths);
+    		if ('total' in $$props) $$invalidate('total', total = $$props.total);
+    		if ('total_infected' in $$props) $$invalidate('total_infected', total_infected = $$props.total_infected);
+    		if ('Iters' in $$props) $$invalidate('Iters', Iters = $$props.Iters);
+    		if ('dIters' in $$props) $$invalidate('dIters', dIters = $$props.dIters);
+    		if ('Pmax' in $$props) $$invalidate('Pmax', Pmax = $$props.Pmax);
+    		if ('checked' in $$props) $$invalidate('checked', checked = $$props.checked);
+    		if ('lock' in $$props) $$invalidate('lock', lock = $$props.lock);
+    		if ('xScaleTimeInv' in $$props) xScaleTimeInv = $$props.xScaleTimeInv;
+    		if ('parsed' in $$props) parsed = $$props.parsed;
+    		if ('xScaleTime' in $$props) $$invalidate('xScaleTime', xScaleTime = $$props.xScaleTime);
+    		if ('indexToTime' in $$props) $$invalidate('indexToTime', indexToTime = $$props.indexToTime);
+    		if ('active' in $$props) $$invalidate('active', active = $$props.active);
+    		if ('active_' in $$props) $$invalidate('active_', active_ = $$props.active_);
+    		if ('ode_eqn' in $$props) $$invalidate('ode_eqn', ode_eqn = $$props.ode_eqn);
+    		if ('p_num_ind' in $$props) $$invalidate('p_num_ind', p_num_ind = $$props.p_num_ind);
+    		if ('get_d' in $$props) $$invalidate('get_d', get_d = $$props.get_d);
+    		if ('milestones' in $$props) $$invalidate('milestones', milestones = $$props.milestones);
+    		if ('log' in $$props) $$invalidate('log', log = $$props.log);
     	};
 
-    	let Time_to_death;
-    	let logN;
-    	let N;
-    	let I0;
-    	let R0;
-    	let D_incbation;
-    	let D_infectious;
-    	let D_recovery_mild;
-    	let D_recovery_severe;
-    	let D_hospital_lag;
-    	let D_death;
-    	let CFR;
-    	let InterventionTime;
-    	let InterventionAmt;
-    	let Time;
-    	let Xmax;
-    	let dt;
-    	let P_SEVERE;
-    	let duration;
-    	let state;
-    	let Sol;
-    	let P;
-    	let timestep;
-    	let tmax;
-    	let deaths;
-    	let total;
-    	let total_infected;
-    	let Iters;
-    	let dIters;
-    	let Pmax;
-    	let lock;
-    	let parsed;
-    	let xScaleTime;
-    	let xScaleTimeInv;
-    	let indexToTime;
-    	let checked;
-    	let active;
-    	let active_;
-    	let ode_eqn;
-    	let p_num_ind;
-    	let get_d;
-    	let milestones;
-    	let log;
+    	let Time_to_death, logN, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_recovery_severe, D_hospital_lag, D_death, CFR, InterventionTime, InterventionAmt, Time, Xmax, dt, P_SEVERE, duration, state, Sol, P, timestep, tmax, deaths, total, total_infected, Iters, dIters, Pmax, lock, parsed, xScaleTime, xScaleTimeInv, indexToTime, checked, active, active_, ode_eqn, p_num_ind, get_d, milestones, log;
 
-    	if ($$props && "$$inject" in $$props) {
-    		$$self.$inject_state($$props.$$inject);
-    	}
-
-    	$$self.$$.update = () => {
-    		if ($$self.$$.dirty[0] & /*logN*/ 4) {
-    			 $$invalidate(3, N = Math.exp(logN));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*Time_to_death, D_infectious*/ 130) {
-    			 $$invalidate(41, D_death = Time_to_death - D_infectious);
-    		}
-
-    		if ($$self.$$.dirty[0] & /*Time_to_death, logN, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_recovery_severe, CFR, InterventionTime, InterventionAmt, D_hospital_lag, P_SEVERE*/ 49142) {
-    			 $$invalidate(16, state = location.protocol + "//" + location.host + location.pathname + "?" + queryString.stringify({
-    				Time_to_death,
-    				logN,
-    				I0,
-    				R0,
-    				D_incbation,
-    				D_infectious,
-    				D_recovery_mild,
-    				D_recovery_severe,
-    				CFR,
-    				InterventionTime,
-    				InterventionAmt,
-    				D_hospital_lag,
-    				P_SEVERE
-    			}));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, P_SEVERE, CFR, InterventionTime, InterventionAmt*/ 49144 | $$self.$$.dirty[1] & /*dt, D_death, duration*/ 13312) {
-    			 $$invalidate(45, Sol = get_solution(dt, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, D_death, P_SEVERE, CFR, InterventionTime, InterventionAmt, duration));
-    		}
-
-    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
-    			 $$invalidate(17, P = Sol["P"].slice(0, 100));
-    		}
-
-    		if ($$self.$$.dirty[1] & /*dt*/ 4096) {
-    			 $$invalidate(18, timestep = dt);
-    		}
-
-    		if ($$self.$$.dirty[1] & /*dt*/ 4096) {
-    			 $$invalidate(19, tmax = dt * 100);
-    		}
-
-    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
-    			 $$invalidate(20, deaths = Sol["deaths"]);
-    		}
-
-    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
-    			 $$invalidate(21, total = Sol["total"]);
-    		}
-
-    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
-    			 $$invalidate(22, total_infected = Sol["total_infected"].slice(0, 100));
-    		}
-
-    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
-    			 $$invalidate(23, Iters = Sol["Iters"]);
-    		}
-
-    		if ($$self.$$.dirty[1] & /*Sol*/ 16384) {
-    			 $$invalidate(46, dIters = Sol["dIters"]);
-    		}
-
-    		if ($$self.$$.dirty[0] & /*P, checked*/ 33685504) {
-    			 $$invalidate(24, Pmax = max(P, checked));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*tmax*/ 524288) {
-    			 $$invalidate(27, xScaleTime = linear$1().domain([0, tmax]).range([padding.left, width - padding.right]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*tmax*/ 524288) {
-    			 xScaleTimeInv = linear$1().domain([0, width]).range([0, tmax]);
-    		}
-
-    		if ($$self.$$.dirty[0] & /*P, tmax*/ 655360) {
-    			 $$invalidate(28, indexToTime = linear$1().domain([0, P.length]).range([0, tmax]));
-    		}
-
-    		if ($$self.$$.dirty[0] & /*active, Iters*/ 545259520) {
-    			 $$invalidate(30, active_ = active >= 0 ? active : Iters.length - 1);
-    		}
-
-    		if ($$self.$$.dirty[0] & /*indexToTime, Iters*/ 276824064 | $$self.$$.dirty[1] & /*dIters*/ 32768) {
-    			 $$invalidate(33, get_d = function (i) {
-    				return dIters(indexToTime(i), Iters[i]);
-    			});
-    		}
-
-    		if ($$self.$$.dirty[0] & /*P*/ 131072) {
-    			 $$invalidate(34, milestones = get_milestones(P));
-    		}
+    	$$self.$$.update = ($$dirty = { logN: 1, Time_to_death: 1, D_infectious: 1, I0: 1, R0: 1, D_incbation: 1, D_recovery_mild: 1, D_recovery_severe: 1, CFR: 1, InterventionTime: 1, InterventionAmt: 1, D_hospital_lag: 1, P_SEVERE: 1, dt: 1, N: 1, D_death: 1, duration: 1, Sol: 1, P: 1, checked: 1, tmax: 1, width: 1, active: 1, Iters: 1, Rt_s: 1, Tinc_s: 1, Tinf_s: 1, dIters: 1, indexToTime: 1 }) => {
+    		if ($$dirty.logN) { $$invalidate('N', N                 = Math.exp(logN)); }
+    		if ($$dirty.Time_to_death || $$dirty.D_infectious) { $$invalidate('D_death', D_death           = Time_to_death - D_infectious); }
+    		if ($$dirty.Time_to_death || $$dirty.logN || $$dirty.I0 || $$dirty.R0 || $$dirty.D_incbation || $$dirty.D_infectious || $$dirty.D_recovery_mild || $$dirty.D_recovery_severe || $$dirty.CFR || $$dirty.InterventionTime || $$dirty.InterventionAmt || $$dirty.D_hospital_lag || $$dirty.P_SEVERE) { $$invalidate('state', state = location.protocol + '//' + location.host + location.pathname + "?" + queryString.stringify({"Time_to_death":Time_to_death,
+                       "logN":logN,
+                       "I0":I0,
+                       "R0":R0,
+                       "D_incbation":D_incbation,
+                       "D_infectious":D_infectious,
+                       "D_recovery_mild":D_recovery_mild,
+                       "D_recovery_severe":D_recovery_severe,
+                       "CFR":CFR,
+                       "InterventionTime":InterventionTime,
+                       "InterventionAmt":InterventionAmt,
+                       "D_hospital_lag":D_hospital_lag,
+                       "P_SEVERE": P_SEVERE})); }
+    		if ($$dirty.dt || $$dirty.N || $$dirty.I0 || $$dirty.R0 || $$dirty.D_incbation || $$dirty.D_infectious || $$dirty.D_recovery_mild || $$dirty.D_hospital_lag || $$dirty.D_recovery_severe || $$dirty.D_death || $$dirty.P_SEVERE || $$dirty.CFR || $$dirty.InterventionTime || $$dirty.InterventionAmt || $$dirty.duration) { $$invalidate('Sol', Sol            = get_solution(dt, N, I0, R0, D_incbation, D_infectious, D_recovery_mild, D_hospital_lag, D_recovery_severe, D_death, P_SEVERE, CFR, InterventionTime, InterventionAmt, duration)); }
+    		if ($$dirty.Sol) { $$invalidate('P', P              = Sol["P"].slice(0,100)); }
+    		if ($$dirty.dt) { $$invalidate('timestep', timestep       = dt); }
+    		if ($$dirty.dt) { $$invalidate('tmax', tmax           = dt*100); }
+    		if ($$dirty.Sol) { $$invalidate('deaths', deaths         = Sol["deaths"]); }
+    		if ($$dirty.Sol) { $$invalidate('total', total          = Sol["total"]); }
+    		if ($$dirty.Sol) { $$invalidate('total_infected', total_infected = Sol["total_infected"].slice(0,100)); }
+    		if ($$dirty.Sol) { $$invalidate('Iters', Iters          = Sol["Iters"]); }
+    		if ($$dirty.Sol) { $$invalidate('dIters', dIters         = Sol["dIters"]); }
+    		if ($$dirty.P || $$dirty.checked) { $$invalidate('Pmax', Pmax           = max(P, checked)); }
+    		if ($$dirty.tmax || $$dirty.width) { $$invalidate('xScaleTime', xScaleTime = linear$1()
+            .domain([0, tmax])
+            .range([padding.left, width$1 - padding.right])); }
+    		if ($$dirty.width || $$dirty.tmax) { xScaleTimeInv = linear$1()
+            .domain([0, width$1])
+            .range([0, tmax]); }
+    		if ($$dirty.P || $$dirty.tmax) { $$invalidate('indexToTime', indexToTime = linear$1()
+            .domain([0, P.length])
+            .range([0, tmax])); }
+    		if ($$dirty.active || $$dirty.Iters) { $$invalidate('active_', active_ = active >= 0 ? active : Iters.length - 1); }
+    		if ($$dirty.Rt_s || $$dirty.Tinc_s || $$dirty.Tinf_s) { $$invalidate('ode_eqn', ode_eqn = katex$1.renderToString("\\frac{d S}{d t}=-" +Rt_s +"\\cdot IS,\\qquad \\frac{d E}{d t}=" +Rt_s +"\\cdot IS- " + Tinc_s + " E,\\qquad \\frac{d I}{d t}=" + Tinc_s + "E-" + Tinf_s+ "I, \\qquad \\frac{d R}{d t}=" + Tinf_s+ "I", {
+            throwOnError: false,
+            displayMode: true,
+            colorIsTextColor: true
+          })); }
+    		if ($$dirty.dIters || $$dirty.indexToTime || $$dirty.Iters) { $$invalidate('get_d', get_d = function(i){
+            return dIters(indexToTime(i), Iters[i])
+          }); }
+    		if ($$dirty.P) { $$invalidate('milestones', milestones = get_milestones(P)); }
     	};
 
-    	 $$invalidate(1, Time_to_death = 32);
-    	 $$invalidate(2, logN = Math.log(7000000));
-    	 $$invalidate(4, I0 = 1);
-    	 $$invalidate(5, R0 = 2.2);
-    	 $$invalidate(6, D_incbation = 5.2);
-    	 $$invalidate(7, D_infectious = 2.9);
-    	 $$invalidate(8, D_recovery_mild = 14 - 2.9);
-    	 $$invalidate(9, D_recovery_severe = 31.5 - 2.9);
-    	 $$invalidate(10, D_hospital_lag = 5);
-    	 $$invalidate(11, CFR = 0.02);
-    	 $$invalidate(12, InterventionTime = 100);
-    	 $$invalidate(13, InterventionAmt = 1 / 3);
-    	 Time = 220;
-    	 $$invalidate(14, Xmax = 110000);
-    	 $$invalidate(43, dt = 2);
-    	 $$invalidate(15, P_SEVERE = 0.2);
-    	 $$invalidate(44, duration = 7 * 12 * 10000000000);
-    	 $$invalidate(25, checked = [true, true, false, true, true]);
-    	 $$invalidate(26, lock = false);
-    	 parsed = "";
-    	 $$invalidate(29, active = 0);
+    	$$invalidate('Time_to_death', Time_to_death     = 32);
+    	$$invalidate('logN', logN              = Math.log(7e6));
+    	$$invalidate('I0', I0                = 1);
+    	$$invalidate('R0', R0                = 2.2);
+    	$$invalidate('D_incbation', D_incbation       = 5.2);
+    	$$invalidate('D_infectious', D_infectious      = 2.9);
+    	$$invalidate('D_recovery_mild', D_recovery_mild   = (14 - 2.9));
+    	$$invalidate('D_recovery_severe', D_recovery_severe = (31.5 - 2.9));
+    	$$invalidate('D_hospital_lag', D_hospital_lag    = 5);
+    	$$invalidate('CFR', CFR               = 0.02);
+    	$$invalidate('InterventionTime', InterventionTime  = 100);
+    	$$invalidate('InterventionAmt', InterventionAmt   = 1/3);
+    	Time              = 220;
+    	$$invalidate('Xmax', Xmax              = 110000);
+    	$$invalidate('dt', dt                = 2);
+    	$$invalidate('P_SEVERE', P_SEVERE          = 0.2);
+    	$$invalidate('duration', duration          = 7*12*1e10);
+    	$$invalidate('checked', checked = [true, true, false, true, true]);
+    	$$invalidate('lock', lock           = false);
+    	parsed = "";
+    	$$invalidate('active', active  = 0);
+    	$$invalidate('p_num_ind', p_num_ind = 40);
+    	$$invalidate('log', log = true);
 
-    	 $$invalidate(31, ode_eqn = katex$1.renderToString("\\frac{d S}{d t}=-" + Rt_s + "\\cdot IS,\\qquad \\frac{d E}{d t}=" + Rt_s + "\\cdot IS- " + Tinc_s + " E,\\qquad \\frac{d I}{d t}=" + Tinc_s + "E-" + Tinf_s + "I, \\qquad \\frac{d R}{d t}=" + Tinf_s + "I", {
-    		throwOnError: false,
-    		displayMode: true,
-    		colorIsTextColor: true
-    	}));
-
-    	 $$invalidate(32, p_num_ind = 40);
-    	 $$invalidate(35, log = true);
-
-    	return [
+    	return {
+    		colors,
     		Plock,
+    		lock_yaxis,
+    		padding,
     		Time_to_death,
     		logN,
+    		Math,
     		N,
     		I0,
     		R0,
@@ -27436,33 +26245,6 @@
     		get_d,
     		milestones,
     		log,
-    		colors,
-    		lock_yaxis,
-    		padding,
-    		width,
-    		height,
-    		D_death,
-    		Time,
-    		dt,
-    		duration,
-    		Sol,
-    		dIters,
-    		xScaleTimeInv,
-    		parsed,
-    		sum,
-    		Integrators,
-    		integrate,
-    		get_solution,
-    		max,
-    		drag_y,
-    		drag_x,
-    		drag_intervention,
-    		drag_intervention_end,
-    		unlock_yaxis,
-    		Tinc_s,
-    		Tinf_s,
-    		Rt_s,
-    		get_milestones,
     		checkbox1_checked_binding,
     		checkbox2_checked_binding,
     		func,
@@ -27485,20 +26267,14 @@
     		input10_change_input_handler,
     		input11_change_input_handler,
     		input12_input_handler
-    	];
+    	};
     }
 
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$3, create_fragment$3, safe_not_equal, {}, [-1, -1, -1]);
-
-    		dispatch_dev("SvelteRegisterComponent", {
-    			component: this,
-    			tagName: "App",
-    			options,
-    			id: create_fragment$3.name
-    		});
+    		init(this, options, instance$3, create_fragment$3, safe_not_equal, []);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "App", options, id: create_fragment$3.name });
     	}
     }
 

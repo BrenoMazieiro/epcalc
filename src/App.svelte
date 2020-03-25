@@ -596,7 +596,7 @@
 
   <div style="flex: 0 0 270px; width:270px;">
     <div style="position:relative; top:48px; right:-115px">
-      <div class="legendtext" style="position:absolute; left:-16px; top:-34px; width:50px; height: 100px; font-size: 13px; line-height:16px; font-weight: normal; text-align: center"><b>Day</b><br> {Math.round(indexToTime(active_))}</div>
+      <div class="legendtext" style="position:absolute; left:-16px; top:-34px; width:50px; height: 100px; font-size: 13px; line-height:16px; font-weight: normal; text-align: center"><b>Dia</b><br> {Math.round(indexToTime(active_))}</div>
 
       <!-- Susceptible -->
       <div style="position:absolute; left:0px; top:0px; width: 180px; height: 100px">
@@ -609,7 +609,7 @@
           <div style="padding-top: 5px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*Iters[active_][0]))} 
                                   ({ (100*Iters[active_][0]).toFixed(2) }%)</i></div>
-          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[0]))} / day</i>
+          <div class="legendtextnum"><span style="font-size:12px; padding-right:2px; color:#CCC">Δ</span> <i>{formatNumber(Math.round(N*get_d(active_)[0]))} / dia</i>
                                  </div>
           </div>
         </div>
@@ -624,7 +624,7 @@
         <Arrow height="41"/>
 
         <div class="legend" style="position:absolute;">
-          <div class="legendtitle">Exposed</div>
+          <div class="legendtitle">Exposto</div>
 
           <div style="padding-top: 5px; padding-bottom: 1px">
           <div class="legendtextnum"><span style="font-size:12px; padding-right:3px; color:#CCC">∑</span> <i>{formatNumber(Math.round(N*Iters[active_][1]))} 
@@ -905,7 +905,7 @@
       <div class="slidertext">{(D_incbation).toFixed(2)} dias</div>
       <input class="range" style="margin-bottom: 8px"type=range bind:value={D_incbation} min={0.15} max=24 step=0.0001>
       <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Duração que o paciente é infeccioso, {@html math_inline("T_{\\text{inf}}")}.<br></div>
-      <div class="slidertext">{D_infectious} Days</div>
+      <div class="slidertext">{D_infectious} Dias</div>
       <input class="range" type=range bind:value={D_infectious} min={0} max=24 step=0.01>
     </div>
 
@@ -924,7 +924,7 @@
     <div class="column">
       <div class="paneltitle">Tempo de recuperação</div>
       <div class="paneldesc" style="height:30px">Tempo de internação hospitalar<br></div>
-      <div class="slidertext">{D_recovery_severe} Days</div>
+      <div class="slidertext">{D_recovery_severe} Dias</div>
       <input class="range" style="margin-bottom: 8px" type=range bind:value={D_recovery_severe} min={0.1} max=100 step=0.01>
       <div class="paneldesc" style="height:29px; border-top: 1px solid #EEE; padding-top: 10px">Tempo de recuperação para casos leves<br></div>
       <div class="slidertext">{D_recovery_mild} Dias</div>
@@ -947,13 +947,13 @@
 <div style="position: relative; height: 12px"></div>
 
 <p class = "center">
-No momento da redação deste artigo, a doença de coronavírus de 2019 continua sendo uma crise global de saúde de magnitude séria e incerta. Para o não especialista (como eu), contextualizar os números, previsões e parâmetros epidemiológicos descritos na mídia e na literatura pode ser um desafio. Criei esta calculadora como uma tentativa de abordar essa lacuna no entendimento.<br />
+Esta excelente calculadora Epidêmica desenvolvida por Gabriel Goh (<a href="http://gabgoh.github.io/" >http://gabgoh.github.io/</a>) e colaboradores esta sendo disponibilizada para servir como ferramenta de testes para o cenário brasileiro. Como é muito bem colocado na versão original deste trabalho para o não especialista, contextualizar os números, previsões e parâmetros epidemiológicos descritos na mídia e na literatura pode ser um desafio. Assim, essa calculadora foi criada como uma tentativa de abordar essa lacuna no entendimento. O nosso grupo esta trabalhando para, a partir dessa inciativa, carregar outros modelos que podem vir a ser uteis para a análise dos casos no Brasil.<br />
 Autor: https://github.com/gabgoh<br />
 Adaptação: https://github.com/BrenoMazieiro<br />
 </p>
 
 <p class = "center">
-Esta calculadora implementa um modelo clássico de doença infecciosa &mdash <b><a href="https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SEIR_model">SEIR</a> </b>(<b>S</b>usceptible → <span style="color:{colors[4]}"><b>E</b></span>xposed → <span style="color:{colors[3]}"><b>I</b></span>nfected → <span><b>R</b></span>emoved), um modelo idealizado de propagação ainda usado nas linhas de frente da pesquisa como em: [<a href="https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext">Wu, et. al</a>, <a href = "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html">Kucharski et. al</a>]. A dinâmica deste modelo é caracterizada por um conjunto de quatro equações diferenciais ordinárias que correspondem aos estágios da progressão da doença:
+Esta calculadora implementa um modelo clássico de doença infecciosa &mdash <b><a href="https://en.wikipedia.org/wiki/Compartmental_models_in_epidemiology#The_SEIR_model">SEIR</a> </b>(<b>S</b>uscetível → <span style="color:{colors[4]}"><b>E</b></span>xposto → <span style="color:{colors[3]}"><b>I</b></span>nfectado → <span style="color:{colors[2]}"><b>R</b></span>ecuperado ,do inglês: <i><b>S</b>usceptible → <span style="color:{colors[4]}"><b>E</b></span>xposed → <span style="color:{colors[3]}"><b>I</b></span>nfected → <span style="color:{colors[3]}"><b>R</b></span>ecovered</i>), um modelo idealizado de propagação ainda usado nas linhas de frente da pesquisa como em: [<a href="https://www.thelancet.com/journals/lancet/article/PIIS0140-6736(20)30260-9/fulltext">Wu, et. al</a>, <a href = "https://cmmid.github.io/topics/covid19/current-patterns-transmission/wuhan-early-dynamics.html">Kucharski et. al</a>]. A dinâmica deste modelo é caracterizada por um conjunto de quatro equações diferenciais ordinárias que correspondem aos estágios da progressão da doença:
 <span style="color:#777">{@html ode_eqn}</span>
 Além da dinâmica de transmissão, este modelo permite o uso de informações suplementares de tempo para modelar a taxa de mortalidade e a carga de assistência médica.
 </p>
@@ -1064,10 +1064,6 @@ Uma amostra das estimativas para parâmetros epidêmicos é apresentada abaixo:
 Veja em [<a href="https://academic.oup.com/jtm/advance-article/doi/10.1093/jtm/taaa021/5735319">Liu et. al</a>] o levantamento detalhado das estimativas atuais do número de reprodução. Os parâmetros para as características clínicas das doenças são obtidos a partir dos seguintes <a href="https://www.who.int/docs/default-source/coronaviruse/who-china-joint-mission-on-covid-19-final-report.pdf">WHO Report</a>. 
 </p>
 
-<p class="center">
-Please DM me feedback <a href="https://twitter.com/gabeeegoooh">here</a> or email me <a href="mailto:izmegabe@gmail.com">here</a>. My <a href="http://gabgoh.github.io/">website</a>.
-</p>
-
 
 <p class = "center">
 <b> Detalhes do modelo </b><br>
@@ -1076,9 +1072,9 @@ A dinâmica clínica desse modelo é uma elaboração do SEIR que simula a progr
 
 <p class = "center">
 <b> Agradecimentos </b><br>
-<a href = "https://enkimute.github.io/">Steven De Keninck</a> for RK4 Integrator. <a href="https://twitter.com/ch402">Chris Olah</a>, <a href="https://twitter.com/shancarter">Shan Carter
-</a> and <a href="https://twitter.com/ludwigschubert">Ludwig Schubert
-</a> wonderful feedback. Charlie Huang for context and discussion.
+<a href = "https://enkimute.github.io/">Steven De Keninck</a> pelo RK4 Integrator. <a href="https://twitter.com/ch402">Chris Olah</a>, <a href="https://twitter.com/shancarter">Shan Carter
+</a> e <a href="https://twitter.com/ludwigschubert">Ludwig Schubert
+</a> pelo maravilhoso feedback. Charlie Huang pela contextualização e discussão.
 </p>
 
 <!-- Input data -->
